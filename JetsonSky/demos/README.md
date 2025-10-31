@@ -1,6 +1,6 @@
 # JetsonSky Demo Applications
 
-This directory contains demonstration applications showcasing the Phase 1 refactoring of JetsonSky.
+This directory contains demonstration applications showcasing the Phase 1 & Phase 2 refactoring of JetsonSky.
 
 ## 📦 Contents
 
@@ -121,6 +121,90 @@ python3 gui_demo.py
 │  [▶ Start] [⏹ Stop] [📊 View Config]       │
 └─────────────────────────────────────────────┘
 ```
+
+---
+
+### 4. **✨ Enhanced GUI Demo with Real-Time Frame Display (`gui_demo_enhanced.py`)** ⭐ NEW!
+
+**Real-time astronomy imaging GUI with Phase 2 filter integration and live frame display!**
+
+**Features:**
+- **Real-time frame preview** with filtered output
+- **Phase 2 filter pipeline integration** - see filters applied in real-time!
+- Camera selection and configuration
+- Live statistics (FPS, frame count, image statistics)
+- 6 filters with visual preview:
+  - Flip (vertical/horizontal)
+  - Hot pixel removal
+  - Denoise (KNN)
+  - Sharpen (unsharp mask)
+  - CLAHE contrast enhancement
+  - Saturation boost
+- **Save filtered images** to disk (PNG/TIFF)
+- Performance monitoring
+- Status log with timestamps
+
+**Requirements:**
+```bash
+pip install numpy opencv-python Pillow
+```
+
+**Usage:**
+```bash
+cd JetsonSky/demos
+python3 gui_demo_enhanced.py
+```
+
+**Layout:**
+```
+┌────────────────────────────────────────────────────────────────────┐
+│                JetsonSky Enhanced Demo - Real-Time Filtering       │
+├───────────┬───────────────────────────────────────┬────────────────┤
+│ Camera &  │      Camera Preview (640x480)         │ Phase 2 Filters│
+│ Settings  │  ┌─────────────────────────────────┐  │                │
+│           │  │                                 │  │ Transform:     │
+│ Camera:   │  │     [LIVE FILTERED IMAGE]       │  │ ☐ Flip Vert.   │
+│ ASI178MC  │  │                                 │  │ ☐ Flip Horiz.  │
+│           │  │    << Real-time preview >>      │  │                │
+│ [Load]    │  │                                 │  │ Cleanup:       │
+│           │  └─────────────────────────────────┘  │ ☑ Hot Pixels   │
+│ Exp: 1000 │  Frame 42 | 640x480 | Mean: 2456    │                │
+│ [────]    │  FPS: 28.3  Frame: 42                │ Enhancement:   │
+│           │                                      │ ☑ Denoise      │
+│ Gain: 150 │                                      │ ☑ Sharpen      │
+│ [───]     │                                      │ ☑ CLAHE        │
+│           │                                      │ ☐ Saturation   │
+│ Binning:  │                                      │                │
+│ ○ 1x1     │                                      │ Pipeline Info: │
+│ ● 2x2     │                                      │ Total: 6       │
+│           │                                      │ Active: 3      │
+│ [▶ Start] │                                      │ ✓ HotPixel     │
+│ [⏹ Stop]  │                                      │ ✓ Denoise      │
+│ [💾 Save] │                                      │ ✓ Sharpen      │
+│           │                                      │                │
+├───────────┴──────────────────────────────────────┴────────────────┤
+│ Status Log:                                                        │
+│ [12:34:56] ✓ GUI initialized                                      │
+│ [12:34:57] ✓ Camera loaded: ZWO ASI178MC                          │
+│ [12:35:01] ▶ Acquisition started                                  │
+│ [12:35:05] Pipeline updated: 3/6 filters active                   │
+│ [12:35:12] ✓ Saved: jetsonsky_frame_20240315_123512.png           │
+└────────────────────────────────────────────────────────────────────┘
+```
+
+**Key Improvements over basic GUI:**
+- ✅ **Visual feedback** - See exactly what your filters are doing!
+- ✅ **Real-time preview** - No blind parameter tweaking
+- ✅ **Filter pipeline** - Phase 2 modular filters fully integrated
+- ✅ **Performance stats** - Monitor FPS and frame statistics
+- ✅ **Image save** - Export filtered frames immediately
+- ✅ **Professional layout** - Three-panel design with live preview
+
+**Perfect for:**
+- Testing Phase 2 filter configurations
+- Real-time astronomy image processing
+- Demonstrating the refactored architecture
+- Filter parameter tuning with visual feedback
 
 ---
 
