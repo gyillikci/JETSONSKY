@@ -475,12 +475,12 @@ class EnhancedJetsonSkyGUI:
                         self.camera.set_control_value(asi.ASI_EXPOSURE, self.app.processing.exposition)
                         self.camera.set_control_value(asi.ASI_BANDWIDTHOVERLOAD, 50)
                         
-                        # Set ROI
+                        # Set ROI - use RGB24 for color output
                         self.camera.set_roi(
                             width=resolution[0],
                             height=resolution[1],
                             bins=self.app.binning_mode,
-                            image_type=asi.ASI_IMG_RAW8
+                            image_type=asi.ASI_IMG_RGB24
                         )
                         
                         self.camera.start_video_capture()
@@ -550,13 +550,16 @@ class EnhancedJetsonSkyGUI:
                 try:
                     # Get frame based on camera type
                     if hasattr(self, 'using_real_camera') and self.using_real_camera:
-                        # Real camera - capture video frame
+                        # Real camera - capture video frame in RGB24 format
                         frame_data = self.camera.capture_video_frame(timeout=1000)
                         if frame_data is not None:
-                            # Convert to numpy array
+                            # Convert to numpy array - RGB24 has 3 channels
                             resolution = self.app.get_current_resolution()
                             frame = np.frombuffer(frame_data, dtype=np.uint8)
-                            frame = frame.reshape((resolution[1], resolution[0]))
+                            frame = frame.reshape((resolution[1], resolution[0], 3))
+                            # Convert RGB to BGR for OpenCV
+                            if HAS_OPENCV:
+                                frame = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
                         else:
                             frame = None
                     else:

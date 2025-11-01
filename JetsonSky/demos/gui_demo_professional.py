@@ -292,7 +292,7 @@ class ProfessionalJetsonSkyGUI:
 
         # Binning
         bin_frame = tk.LabelFrame(scroll_frame, text="Binning", padx=5, pady=5)
-        bin_frame.grid(row=3, column=0, columnspan=2, sticky="ew", padx=5, pady=5)
+        bin_frame.pack(fill=tk.X, padx=5, pady=5)
         tk.Radiobutton(bin_frame, text="1x1", variable=self.binning_var, value=1,
                       command=self.update_binning).pack(side=tk.LEFT)
         tk.Radiobutton(bin_frame, text="2x2", variable=self.binning_var, value=2,
@@ -300,7 +300,7 @@ class ProfessionalJetsonSkyGUI:
 
         # Flip controls
         flip_frame = tk.LabelFrame(scroll_frame, text="Flip", padx=5, pady=5)
-        flip_frame.grid(row=4, column=0, columnspan=2, sticky="ew", padx=5, pady=5)
+        flip_frame.pack(fill=tk.X, padx=5, pady=5)
         tk.Checkbutton(flip_frame, text="Vertical", variable=self.flip_v_var,
                       command=self.update_flip).pack(anchor=tk.W)
         tk.Checkbutton(flip_frame, text="Horizontal", variable=self.flip_h_var,
@@ -373,7 +373,7 @@ class ProfessionalJetsonSkyGUI:
 
         # White Balance section
         wb_frame = tk.LabelFrame(scroll_frame, text="White Balance", padx=5, pady=5)
-        wb_frame.grid(row=row, column=0, columnspan=2, sticky="ew", padx=5, pady=5)
+        wb_frame.pack(fill=tk.X, padx=5, pady=5)
         row += 1
 
         tk.Checkbutton(wb_frame, text="Enable WB", variable=self.enable_wb_var,
@@ -391,7 +391,7 @@ class ProfessionalJetsonSkyGUI:
 
         # RGB Channel Multipliers
         rgb_frame = tk.LabelFrame(scroll_frame, text="RGB Multipliers", padx=5, pady=5)
-        rgb_frame.grid(row=row, column=0, columnspan=2, sticky="ew", padx=5, pady=5)
+        rgb_frame.pack(fill=tk.X, padx=5, pady=5)
         row += 1
 
         tk.Label(rgb_frame, text="Red:").grid(row=0, column=0, sticky=tk.W)
@@ -588,7 +588,7 @@ class ProfessionalJetsonSkyGUI:
     def create_slider(self, parent, label, variable, from_, to, resolution, command, row):
         """Create labeled slider control."""
         frame = tk.Frame(parent)
-        frame.grid(row=row, column=0, columnspan=2, sticky="ew", padx=5, pady=5)
+        frame.pack(fill=tk.X, padx=5, pady=5)
 
         tk.Label(frame, text=label).pack(anchor=tk.W)
         tk.Scale(frame, from_=from_, to=to, orient=tk.HORIZONTAL, resolution=resolution,
@@ -597,10 +597,7 @@ class ProfessionalJetsonSkyGUI:
     def create_slider_with_checkbox(self, parent, label, variable, checkbox_var, from_, to, resolution, command, row):
         """Create slider with enable checkbox."""
         frame = tk.LabelFrame(parent, text=label, padx=5, pady=5)
-        if hasattr(parent, 'grid'):
-            frame.grid(row=row, column=0, columnspan=2, sticky="ew", padx=5, pady=5)
-        else:
-            frame.pack(fill=tk.X, padx=5, pady=5)
+        frame.pack(fill=tk.X, padx=5, pady=5)
 
         tk.Checkbutton(frame, text="Enable", variable=checkbox_var,
                       command=command).pack(anchor=tk.W)
@@ -838,44 +835,72 @@ class ProfessionalJetsonSkyGUI:
 
         resolution = self.app.get_current_resolution()
 
-        # Try real camera first
+        # Try to use real camera if available
         if HAS_REAL_CAMERA:
             try:
-                asi.init()
-                num_cameras = asi.get_num_cameras()
-                if num_cameras > 0:
-                    self.camera = asi.Camera(0)
-                    # Configure real camera...
-                    self.using_real_camera = True
-                    self.camera_type_label.config(text="Real Camera", fg="green")
-                    self.log("✓ Using real ZWO ASI camera")
+                # Initialize ASI library
+                lib_path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'Lib')
+                if sys.platform == "win32":
+                    asi_lib = os.path.join(lib_path, "ASICamera2.dll")
                 else:
-                    raise Exception("No real camera detected")
-            except:
+                    asi_lib = os.path.join(lib_path, "libASICamera2.so.1.27")
+                
+                if os.path.exists(asi_lib):
+                    asi.init(asi_lib)
+                    num_cameras = asi.get_num_cameras()
+                    
+                    if num_cameras > 0:
+                        # Use real camera
+                        self.camera = asi.Camera(0)
+                        camera_info = self.camera.get_camera_property()
+                        
+                        # Configure camera
+                        self.camera.set_control_value(asi.ASI_GAIN, int(self.gain_var.get()))
+                        self.camera.set_control_value(asi.ASI_EXPOSURE, int(self.exposition_var.get()))
+                        self.camera.set_control_value(asi.ASI_BANDWIDTHOVERLOAD, int(self.usb_bandwidth_var.get()))
+                        
+                        # Set ROI - use RAW8 for faster capture
+                        self.camera.set_roi(
+                            width=resolution[0],
+                            height=resolution[1],
+                            bins=self.binning_var.get(),
+                            image_type=asi.ASI_IMG_RAW8
+                        )
+                        
+                        self.camera.start_video_capture()
+                        self.log(f"▶ Acquisition started with REAL camera: {camera_info['Name']}")
+                        self.camera_type_label.config(text=f"Real: {camera_info['Name']}", fg="green")
+                        self.using_real_camera = True
+                    else:
+                        raise Exception("No real camera detected")
+                else:
+                    raise Exception("Camera library not found")
+                    
+            except Exception as e:
+                self.log(f"⚠ Real camera failed: {e}, using simulator")
                 self.using_real_camera = False
                 self.camera = create_simulated_camera(
                     self.app.camera_config.model,
                     resolution,
                     self.app.camera_config.sensor_bits
                 )
+                self.camera.set_exposition(self.exposition_var.get())
+                self.camera.set_gain(self.gain_var.get())
+                self.camera.start_capture()
                 self.camera_type_label.config(text="Simulator", fg="blue")
-                self.log("⚠ Using simulated camera")
         else:
+            # Use simulator
             self.camera = create_simulated_camera(
                 self.app.camera_config.model,
                 resolution,
                 self.app.camera_config.sensor_bits
             )
-            self.camera_type_label.config(text="Simulator", fg="blue")
-            self.log("⚠ Using simulated camera")
-
-        # Configure camera
-        if hasattr(self.camera, 'set_exposition'):
             self.camera.set_exposition(self.exposition_var.get())
-        if hasattr(self.camera, 'set_gain'):
             self.camera.set_gain(self.gain_var.get())
-        if hasattr(self.camera, 'start_capture'):
             self.camera.start_capture()
+            self.log("▶ Acquisition started with simulated camera")
+            self.camera_type_label.config(text="Simulator", fg="blue")
+            self.using_real_camera = False
 
         self.app.acquisition_running = True
         self.frame_count = 0
@@ -895,10 +920,21 @@ class ProfessionalJetsonSkyGUI:
         self.app.acquisition_running = False
 
         if self.camera:
-            if hasattr(self.camera, 'stop_capture'):
-                self.camera.stop_capture()
-            if hasattr(self.camera, 'close'):
-                self.camera.close()
+            try:
+                # Stop real camera video capture
+                if hasattr(self, 'using_real_camera') and self.using_real_camera:
+                    if hasattr(self.camera, 'stop_video_capture'):
+                        self.camera.stop_video_capture()
+                    if hasattr(self.camera, 'close'):
+                        self.camera.close()
+                else:
+                    # Stop simulator
+                    if hasattr(self.camera, 'stop_capture'):
+                        self.camera.stop_capture()
+                    if hasattr(self.camera, 'close'):
+                        self.camera.close()
+            except Exception as e:
+                self.log(f"⚠ Error stopping camera: {e}")
 
         self.log("⏹ Acquisition stopped")
         self.status_label.config(text="Stopped")
@@ -908,7 +944,27 @@ class ProfessionalJetsonSkyGUI:
         while self.app.acquisition_running:
             try:
                 if self.camera:
-                    frame = self.camera.capture_frame()
+                    # Get frame based on camera type
+                    if hasattr(self, 'using_real_camera') and self.using_real_camera:
+                        # Real camera - use optimized RAW8 capture with CuPy
+                        try:
+                            if sys.platform == "win32":
+                                frame = self.camera.capture_video_frame_RAW8_CUPY(filename=None, timeout=1000)
+                            else:
+                                frame = self.camera.capture_video_frame_RAW8_NUMPY(filename=None, timeout=1000)
+                            
+                            # Debayer to color if needed
+                            if frame is not None and HAS_OPENCV:
+                                # Convert CuPy to NumPy if needed
+                                if hasattr(frame, 'get'):
+                                    frame = frame.get()
+                                # Debayer using OpenCV
+                                frame = cv2.cvtColor(frame, cv2.COLOR_BayerRG2BGR)
+                        except Exception as e:
+                            frame = None
+                    else:
+                        # Simulator
+                        frame = self.camera.capture_frame()
 
                     if frame is not None and HAS_NUMPY:
                         self.frame_count += 1
@@ -932,7 +988,7 @@ class ProfessionalJetsonSkyGUI:
                             self.frame_queue.put(filtered_frame)
                             self.root.after(0, self.process_frame_queue)
 
-                time.sleep(0.033)  # ~30 FPS
+                time.sleep(0.01)  # Reduced sleep for faster frame rate
             except Exception as e:
                 self.log(f"✗ Acquisition error: {e}")
                 break
