@@ -96,8 +96,8 @@ JetsonSky_version = "V53_07RC"
 
 
 # Choose your keyboard layout
-keyboard_layout = "AZERTY"
-#keyboard_layout = "QWERTY"
+#keyboard_layout = "AZERTY"
+keyboard_layout = "QWERTY"
 
 # Libraries import
 

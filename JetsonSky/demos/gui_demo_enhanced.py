@@ -73,6 +73,14 @@ except ImportError:
     HAS_FILTERS = False
     print("⚠ Phase 2 filters not available")
 
+# Try to import real camera support
+try:
+    import zwoasi_cupy as asi
+    HAS_REAL_CAMERA = True
+except ImportError:
+    HAS_REAL_CAMERA = False
+    print("⚠ Real camera support not available")
+
 from demos.camera_simulator import create_simulated_camera
 
 
@@ -91,6 +99,7 @@ class EnhancedJetsonSkyGUI:
         self.acquisition_thread = None
         self.current_frame = None
         self.photo_image = None
+        self.using_real_camera = False
 
         # Filter pipeline
         self.pipeline = FilterPipeline() if HAS_FILTERS else None
@@ -442,21 +451,73 @@ class EnhancedJetsonSkyGUI:
 
         resolution = self.app.get_current_resolution()
 
-        self.camera = create_simulated_camera(
-            self.app.camera_config.model,
-            resolution,
-            self.app.camera_config.sensor_bits
-        )
-
-        self.camera.set_exposition(self.app.processing.exposition)
-        self.camera.set_gain(self.app.processing.gain)
-        self.camera.start_capture()
+        # Try to use real camera if available
+        if HAS_REAL_CAMERA:
+            try:
+                # Initialize ASI library
+                lib_path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'Lib')
+                if sys.platform == "win32":
+                    asi_lib = os.path.join(lib_path, "ASICamera2.dll")
+                else:
+                    asi_lib = os.path.join(lib_path, "libASICamera2.so.1.27")
+                
+                if os.path.exists(asi_lib):
+                    asi.init(asi_lib)
+                    num_cameras = asi.get_num_cameras()
+                    
+                    if num_cameras > 0:
+                        # Use real camera
+                        self.camera = asi.Camera(0)
+                        camera_info = self.camera.get_camera_property()
+                        
+                        # Configure camera
+                        self.camera.set_control_value(asi.ASI_GAIN, self.app.processing.gain)
+                        self.camera.set_control_value(asi.ASI_EXPOSURE, self.app.processing.exposition)
+                        self.camera.set_control_value(asi.ASI_BANDWIDTHOVERLOAD, 50)
+                        
+                        # Set ROI
+                        self.camera.set_roi(
+                            width=resolution[0],
+                            height=resolution[1],
+                            bins=self.app.binning_mode,
+                            image_type=asi.ASI_IMG_RAW8
+                        )
+                        
+                        self.camera.start_video_capture()
+                        self.log_status(f"▶ Acquisition started with REAL camera: {camera_info['Name']}")
+                        self.using_real_camera = True
+                    else:
+                        raise Exception("No real camera detected")
+                else:
+                    raise Exception("Camera library not found")
+                    
+            except Exception as e:
+                self.log_status(f"⚠ Real camera failed: {e}, using simulator")
+                self.camera = create_simulated_camera(
+                    self.app.camera_config.model,
+                    resolution,
+                    self.app.camera_config.sensor_bits
+                )
+                self.camera.set_exposition(self.app.processing.exposition)
+                self.camera.set_gain(self.app.processing.gain)
+                self.camera.start_capture()
+                self.using_real_camera = False
+        else:
+            # Use simulator
+            self.camera = create_simulated_camera(
+                self.app.camera_config.model,
+                resolution,
+                self.app.camera_config.sensor_bits
+            )
+            self.camera.set_exposition(self.app.processing.exposition)
+            self.camera.set_gain(self.app.processing.gain)
+            self.camera.start_capture()
+            self.log_status("▶ Acquisition started with simulated camera")
+            self.using_real_camera = False
 
         self.app.acquisition_running = True
         self.frame_count = 0
         self.last_time = time.time()
-
-        self.log_status("▶ Acquisition started")
 
         self.acquisition_thread = threading.Thread(target=self.acquisition_loop, daemon=True)
         self.acquisition_thread.start()
@@ -469,7 +530,16 @@ class EnhancedJetsonSkyGUI:
         self.app.acquisition_running = False
 
         if self.camera:
-            self.camera.stop_capture()
+            if hasattr(self, 'using_real_camera') and self.using_real_camera:
+                # Real camera cleanup
+                try:
+                    self.camera.stop_video_capture()
+                    self.camera.close()
+                except:
+                    pass
+            else:
+                # Simulator cleanup
+                self.camera.stop_capture()
 
         self.log_status("⏹ Acquisition stopped")
 
@@ -477,28 +547,44 @@ class EnhancedJetsonSkyGUI:
         """Main acquisition loop."""
         while self.app.acquisition_running:
             if self.camera:
-                frame = self.camera.capture_frame()
-
-                if frame is not None and HAS_NUMPY:
-                    self.frame_count += 1
-
-                    # Calculate FPS
-                    current_time = time.time()
-                    if current_time - self.last_time > 0:
-                        self.fps = 1.0 / (current_time - self.last_time)
-                    self.last_time = current_time
-
-                    # Apply filters if available
-                    if self.pipeline and HAS_OPENCV:
-                        filtered_frame = self.pipeline.apply(frame)
+                try:
+                    # Get frame based on camera type
+                    if hasattr(self, 'using_real_camera') and self.using_real_camera:
+                        # Real camera - capture video frame
+                        frame_data = self.camera.capture_video_frame(timeout=1000)
+                        if frame_data is not None:
+                            # Convert to numpy array
+                            resolution = self.app.get_current_resolution()
+                            frame = np.frombuffer(frame_data, dtype=np.uint8)
+                            frame = frame.reshape((resolution[1], resolution[0]))
+                        else:
+                            frame = None
                     else:
-                        filtered_frame = frame
+                        # Simulator
+                        frame = self.camera.capture_frame()
 
-                    # Store current frame
-                    self.current_frame = filtered_frame
+                    if frame is not None and HAS_NUMPY:
+                        self.frame_count += 1
 
-                    # Update display
-                    self.root.after(0, self.update_display, filtered_frame)
+                        # Calculate FPS
+                        current_time = time.time()
+                        if current_time - self.last_time > 0:
+                            self.fps = 1.0 / (current_time - self.last_time)
+                        self.last_time = current_time
+
+                        # Apply filters if available
+                        if self.pipeline and HAS_OPENCV:
+                            filtered_frame = self.pipeline.apply(frame)
+                        else:
+                            filtered_frame = frame
+
+                        # Store current frame
+                        self.current_frame = filtered_frame
+
+                        # Update display
+                        self.root.after(0, self.update_display, filtered_frame)
+                except Exception as e:
+                    self.log_status(f"✗ Frame capture error: {e}")
 
             time.sleep(0.033)  # ~30 FPS max
 
