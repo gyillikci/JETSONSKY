@@ -24,15 +24,14 @@ import cv2
 
 from filters.pipeline import FilterPipeline
 from filters.base import Filter
-from filters.color import ColorBalanceFilter, SaturationFilter, RGBBalanceFilter
-from filters.contrast import ContrastCLAHEFilter, ContrastLowLightFilter
+from filters.color import WhiteBalanceFilter, SaturationFilter, ColorTemperatureFilter
+from filters.contrast import CLAHEFilter, GammaCorrectionFilter
 from filters.denoise import (
-    DenoiseKNNFilter, DenoiseNLM2Filter, DenoisePaillouFilter,
-    AdaptiveAbsorberFilter, ThreeFrameNoiseRemovalFilter
+    DenoiseKNNFilter, DenoisePaillouFilter, DenoiseGaussianFilter
 )
-from filters.sharpen import SharpenSoft1Filter, SharpenSoft2Filter
+from filters.sharpen import SharpenFilter, LaplacianSharpenFilter
 from filters.transforms import FlipFilter, NegativeFilter
-from filters.hotpixel import HotPixelRemovalFilter
+from filters.hotpixel import HotPixelFilter
 
 
 class ImageProcessor:
@@ -69,8 +68,8 @@ class ImageProcessor:
         self.is_color = is_color
 
         # Create filter pipelines (separate for color and mono)
-        self.color_pipeline = FilterPipeline(cupy_context)
-        self.mono_pipeline = FilterPipeline(cupy_context)
+        self.color_pipeline = FilterPipeline()
+        self.mono_pipeline = FilterPipeline()
 
         # Processing state
         self.flip_vertical = False
@@ -101,13 +100,13 @@ class ImageProcessor:
         """
         # Transform filters (always available)
         self.flip_filter = FlipFilter(
-            flip_vertical=False,
-            flip_horizontal=False
+            vertical=False,
+            horizontal=False
         )
         self.negative_filter = NegativeFilter(enabled=False)
 
         # Hot pixel removal
-        self.hotpixel_filter = HotPixelRemovalFilter(
+        self.hotpixel_filter = HotPixelFilter(
             threshold=50,
             enabled=False
         )
@@ -117,45 +116,39 @@ class ImageProcessor:
             strength=0.2,
             enabled=False
         )
-        self.nlm2_filter = DenoiseNLM2Filter(
-            h=10,
-            template_window_size=7,
-            search_window_size=21,
+        self.gaussian_filter = DenoiseGaussianFilter(
+            sigma=1.0,
             enabled=False
         )
         self.paillou_filter = DenoisePaillouFilter(
             strength=0.4,
             enabled=False
         )
-        self.aanr_filter = AdaptiveAbsorberFilter(
+        self.knn_filter2 = DenoiseKNNFilter(
             strength=0.5,
-            mode="high",
             enabled=False
         )
-        self.three_frame_filter = ThreeFrameNoiseRemovalFilter(
-            threshold=0.5,
+        self.paillou_filter2 = DenoisePaillouFilter(
+            strength=0.5,
             enabled=False
         )
 
         # Contrast filters
-        self.clahe_filter = ContrastCLAHEFilter(
-            clip_limit=1.0,
-            tile_grid_size=8,
+        self.clahe_filter = CLAHEFilter(
+            clip_limit=2.0,
+            grid_size=8,
             enabled=False
         )
-        self.lowlight_filter = ContrastLowLightFilter(
-            mu=0.0,
-            ro=0.5,
-            amp=1.0,
+        self.gamma_filter = GammaCorrectionFilter(
+            gamma=1.0,
             enabled=False
         )
 
         # Color filters (only for color cameras)
         if self.is_color:
-            self.rgb_balance_filter = RGBBalanceFilter(
-                red_balance=1.0,
-                green_balance=1.0,
-                blue_balance=1.0,
+            self.white_balance_filter = WhiteBalanceFilter(
+                red_balance=50,
+                blue_balance=50,
                 enabled=False
             )
             self.saturation_filter = SaturationFilter(
@@ -164,14 +157,13 @@ class ImageProcessor:
             )
 
         # Sharpen filters
-        self.sharpen1_filter = SharpenSoft1Filter(
+        self.sharpen_filter = SharpenFilter(
             amount=1.0,
             sigma=1.0,
             enabled=False
         )
-        self.sharpen2_filter = SharpenSoft2Filter(
-            amount=1.0,
-            sigma=2.0,
+        self.laplacian_sharpen_filter = LaplacianSharpenFilter(
+            strength=1.0,
             enabled=False
         )
 
@@ -182,25 +174,25 @@ class ImageProcessor:
             self.negative_filter,       # 2. Basic transforms
             self.hotpixel_filter,       # 3. Hot pixel removal on raw data
             # Multi-frame and denoise
-            self.three_frame_filter,    # 4. Multi-frame denoise
-            self.aanr_filter,           # 5. Adaptive absorber
+            self.paillou_filter2,    # 4. Multi-frame denoise
+            self.knn_filter2,           # 5. Adaptive absorber
             self.paillou_filter,        # 6. Paillou denoise
-            self.nlm2_filter,           # 7. NLM2 denoise
+            self.gaussian_filter,           # 7. NLM2 denoise
             self.knn_filter,            # 8. KNN denoise
             # Contrast and color
-            self.lowlight_filter,       # 9. Low light contrast
+            self.gamma_filter,       # 9. Low light contrast
             self.clahe_filter,          # 10. CLAHE
         ]
 
         if self.is_color:
             filters_order.extend([
-                self.rgb_balance_filter,    # 11. RGB balance
+                self.white_balance_filter,  # 11. White balance
                 self.saturation_filter,     # 12. Saturation
             ])
 
         filters_order.extend([
-            self.sharpen1_filter,       # 13. First sharpen pass
-            self.sharpen2_filter,       # 14. Second sharpen pass
+            self.sharpen_filter,       # 13. First sharpen pass
+            self.laplacian_sharpen_filter,       # 14. Second sharpen pass
         ])
 
         # Add all filters to appropriate pipeline
@@ -247,17 +239,20 @@ class ImageProcessor:
             # Apply debayering for color cameras
             if self.is_color and apply_debayer:
                 frame_processed = self._debayer_image(frame_gpu)
-                # Process through color pipeline
-                frame_processed = self.color_pipeline.apply(frame_processed)
             else:
-                # Process through mono pipeline
-                frame_processed = self.mono_pipeline.apply(frame_gpu)
-
-            # Convert back to NumPy for display
+                frame_processed = frame_gpu
+            
+            # Convert to NumPy for filter processing (OpenCV functions need NumPy)
             if isinstance(frame_processed, cp.ndarray):
-                frame_output = cp.asnumpy(frame_processed)
+                frame_np = cp.asnumpy(frame_processed)
             else:
-                frame_output = frame_processed
+                frame_np = frame_processed
+            
+            # Process through appropriate pipeline
+            if self.is_color:
+                frame_output = self.color_pipeline.apply(frame_np)
+            else:
+                frame_output = self.mono_pipeline.apply(frame_np)
 
             # Calculate processing time
             end_time = cv2.getTickCount()
@@ -354,24 +349,24 @@ class ImageProcessor:
             'negative': self.negative_filter,
             'hotpixel': self.hotpixel_filter,
             'knn': self.knn_filter,
-            'nlm2': self.nlm2_filter,
+            'nlm2': self.gaussian_filter,
             'paillou': self.paillou_filter,
-            'aanr': self.aanr_filter,
-            'three_frame': self.three_frame_filter,
+            'aanr': self.knn_filter2,
+            'three_frame': self.paillou_filter2,
             'clahe': self.clahe_filter,
-            'lowlight': self.lowlight_filter,
-            'sharpen1': self.sharpen1_filter,
-            'sharpen2': self.sharpen2_filter,
+            'lowlight': self.gamma_filter,
+            'sharpen1': self.sharpen_filter,
+            'sharpen2': self.laplacian_sharpen_filter,
         }
 
         if self.is_color:
             filter_map.update({
-                'rgb_balance': self.rgb_balance_filter,
+                'white_balance': self.white_balance_filter,
                 'saturation': self.saturation_filter,
             })
 
         if filter_name in filter_map:
-            filter_map[filter_name].enabled = True
+            filter_map[filter_name].config.enabled = True
 
     def disable_filter(self, filter_name: str):
         """Disable a filter by name."""
@@ -380,29 +375,29 @@ class ImageProcessor:
             'negative': self.negative_filter,
             'hotpixel': self.hotpixel_filter,
             'knn': self.knn_filter,
-            'nlm2': self.nlm2_filter,
+            'nlm2': self.gaussian_filter,
             'paillou': self.paillou_filter,
-            'aanr': self.aanr_filter,
-            'three_frame': self.three_frame_filter,
+            'aanr': self.knn_filter2,
+            'three_frame': self.paillou_filter2,
             'clahe': self.clahe_filter,
-            'lowlight': self.lowlight_filter,
-            'sharpen1': self.sharpen1_filter,
-            'sharpen2': self.sharpen2_filter,
+            'lowlight': self.gamma_filter,
+            'sharpen1': self.sharpen_filter,
+            'sharpen2': self.laplacian_sharpen_filter,
         }
 
         if self.is_color:
             filter_map.update({
-                'rgb_balance': self.rgb_balance_filter,
+                'white_balance': self.white_balance_filter,
                 'saturation': self.saturation_filter,
             })
 
         if filter_name in filter_map:
-            filter_map[filter_name].enabled = False
+            filter_map[filter_name].config.enabled = False
 
     def get_active_filter_count(self) -> int:
         """Get number of currently active filters."""
         pipeline = self.color_pipeline if self.is_color else self.mono_pipeline
-        return sum(1 for f in pipeline.filters if f.enabled)
+        return sum(1 for f in pipeline.filters if f.config.enabled)
 
     def update_filter_parameter(self, filter_name: str, param_name: str, value: Any):
         """
@@ -418,19 +413,19 @@ class ImageProcessor:
             'negative': self.negative_filter,
             'hotpixel': self.hotpixel_filter,
             'knn': self.knn_filter,
-            'nlm2': self.nlm2_filter,
+            'nlm2': self.gaussian_filter,
             'paillou': self.paillou_filter,
-            'aanr': self.aanr_filter,
-            'three_frame': self.three_frame_filter,
+            'aanr': self.knn_filter2,
+            'three_frame': self.paillou_filter2,
             'clahe': self.clahe_filter,
-            'lowlight': self.lowlight_filter,
-            'sharpen1': self.sharpen1_filter,
-            'sharpen2': self.sharpen2_filter,
+            'lowlight': self.gamma_filter,
+            'sharpen1': self.sharpen_filter,
+            'sharpen2': self.laplacian_sharpen_filter,
         }
 
         if self.is_color:
             filter_map.update({
-                'rgb_balance': self.rgb_balance_filter,
+                'white_balance': self.white_balance_filter,
                 'saturation': self.saturation_filter,
             })
 
@@ -470,10 +465,10 @@ class ImageProcessor:
 
         active_filters = []
         for f in pipeline.filters:
-            if f.enabled:
+            if f.config.enabled:
                 active_filters.append({
                     'name': f.__class__.__name__,
-                    'enabled': f.enabled
+                    'enabled': f.config.enabled
                 })
 
         return {

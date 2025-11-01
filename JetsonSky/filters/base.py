@@ -17,6 +17,14 @@ except ImportError:
     HAS_NUMPY = False
     np = None
 
+# Optional cupy import
+try:
+    import cupy as cp
+    HAS_CUPY = True
+except ImportError:
+    HAS_CUPY = False
+    cp = None
+
 
 @dataclass
 class FilterConfig:
@@ -90,14 +98,21 @@ class Filter(ABC):
         if image is None:
             raise ValueError(f"{self.config.name}: Image cannot be None")
 
-        if HAS_NUMPY:
-            if not isinstance(image, np.ndarray):
-                raise ValueError(f"{self.config.name}: Image must be numpy array")
+        if HAS_NUMPY or HAS_CUPY:
+            # Accept both NumPy and CuPy arrays
+            is_valid_array = False
+            if HAS_NUMPY and isinstance(image, np.ndarray):
+                is_valid_array = True
+            elif HAS_CUPY and isinstance(image, cp.ndarray):
+                is_valid_array = True
+            
+            if not is_valid_array:
+                raise ValueError(f"{self.config.name}: Image must be numpy or cupy array")
 
-            if image.size == 0:
+            if hasattr(image, 'size') and image.size == 0:
                 raise ValueError(f"{self.config.name}: Image cannot be empty")
         else:
-            # Basic validation without numpy
+            # Basic validation without numpy/cupy
             if not hasattr(image, 'shape'):
                 raise ValueError(f"{self.config.name}: Image must have 'shape' attribute")
 
