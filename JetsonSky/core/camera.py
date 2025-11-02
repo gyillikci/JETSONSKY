@@ -222,7 +222,8 @@ class CameraController:
             if self.camera_config:
                 self.resolution_x = self.camera_config.resolution_x
                 self.resolution_y = self.camera_config.resolution_y
-                self.is_color = self.camera_config.is_color
+                # Derive is_color from bayer_pattern (color cameras have Bayer pattern, mono is "MONO")
+                self.is_color = self.camera_config.bayer_pattern != "MONO"
                 print(f'Camera config loaded: {self.resolution_x}x{self.resolution_y}, ' +
                       f'Color: {self.is_color}')
 
@@ -330,18 +331,33 @@ class CameraController:
             return self._raw_frame, True
         return None, False
 
-    def set_exposure(self, exposure_us: int):
+    def set_exposure(self, exposure_us: int, auto: bool = False):
         """Set camera exposure in microseconds."""
         self.exposure = exposure_us
         if self.is_initialized:
-            self.camera.set_control_value(asi.ASI_EXPOSURE, exposure_us)
+            self.camera.set_control_value(asi.ASI_EXPOSURE, exposure_us, auto=auto)
             self.timeout = 1 + (exposure_us // 1000) + 500
 
-    def set_gain(self, gain: int):
+    def set_gain(self, gain: int, auto: bool = False):
         """Set camera gain."""
         self.gain = gain
         if self.is_initialized:
-            self.camera.set_control_value(asi.ASI_GAIN, gain)
+            self.camera.set_control_value(asi.ASI_GAIN, gain, auto=auto)
+
+    def set_control_value(self, control_type, value, auto: bool = False):
+        """Set a camera control value with optional auto mode."""
+        if self.is_initialized:
+            self.camera.set_control_value(control_type, value, auto=auto)
+
+    def get_control_value(self, control_type):
+        """Get current value of a camera control.
+        
+        Returns:
+            tuple: (value, auto_mode) where auto_mode is True if auto is enabled
+        """
+        if self.is_initialized:
+            return self.camera.get_control_value(control_type)
+        return (0, False)
 
     def set_usb_bandwidth(self, bandwidth: int):
         """Set USB bandwidth (40-100)."""

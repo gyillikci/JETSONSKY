@@ -22,6 +22,7 @@ import time
 from datetime import datetime
 from tkinter import *
 from tkinter import filedialog
+from tkinter import Canvas, Scrollbar
 import PIL.Image
 import PIL.ImageTk
 import numpy as np
@@ -30,6 +31,9 @@ import cv2
 # Platform detection
 my_os = sys.platform
 print(f"Platform: {my_os}")
+
+# Import camera library
+import zwoasi_cupy as asi
 
 # Import refactored OOP components
 try:
@@ -47,7 +51,20 @@ from core import (
     get_camera_config,
     AppState
 )
-from io import CaptureManager
+# Import from local io package (avoid built-in io module conflict)
+import importlib.util
+io_capture_spec = importlib.util.spec_from_file_location(
+    "capture_manager",
+    os.path.join(os.path.dirname(__file__), "io", "capture_manager.py")
+)
+if io_capture_spec and io_capture_spec.loader:
+    io_capture_module = importlib.util.module_from_spec(io_capture_spec)
+    io_capture_spec.loader.exec_module(io_capture_module)
+    CaptureManager = io_capture_module.CaptureManager
+    print("CaptureManager loaded")
+else:
+    print("Warning: CaptureManager not available")
+    CaptureManager = None
 from ai import AIDetector
 
 # Configure paths
@@ -101,8 +118,33 @@ class JetsonSkyGUI:
         self.preview_active = False
 
         # Display settings
-        self.display_width = 1280
-        self.display_height = 960
+        self.display_width = 1920
+        self.display_height = 1440
+        
+        # Scrollable canvas settings
+        self.full_frame = None  # Store full resolution frame
+        self.photo_image = None  # Keep reference to PhotoImage
+        self.canvas_image_id = None  # Canvas image item id
+        
+        # Auto control flags to prevent circular triggers
+        self.updating_auto_controls = False
+        
+        # Stabilization variables
+        self.flag_stab = False
+        self.flag_template = False
+        self.template = None
+        self.delta_tx = 0
+        self.delta_ty = 0
+        self.dsw = 0  # Stabilization window size adjustment
+        self.stab_start_point = (0, 0)
+        self.stab_end_point = (0, 0)
+        self.flag_new_stab_window = False
+        
+        # OpenCV CUDA template matching objects (if available)
+        self.gsrc = None
+        self.gtmpl = None
+        self.gresult = None
+        self.matcher = None
 
         # Build GUI
         self.create_widgets()
@@ -120,12 +162,31 @@ class JetsonSkyGUI:
         left_frame = Frame(main_frame, bg='black')
         left_frame.pack(side=LEFT, fill=BOTH, expand=True, padx=5, pady=5)
 
-        # Camera preview label
-        self.preview_label = Label(left_frame, bg='black', text="Camera Preview")
-        self.preview_label.pack(fill=BOTH, expand=True)
+        # Create scrollable canvas for preview
+        canvas_frame = Frame(left_frame, bg='black')
+        canvas_frame.pack(fill=BOTH, expand=True)
+        
+        # Create canvas with scrollbars
+        self.preview_canvas = Canvas(canvas_frame, bg='black', highlightthickness=0)
+        h_scrollbar = Scrollbar(canvas_frame, orient=HORIZONTAL, command=self.preview_canvas.xview)
+        v_scrollbar = Scrollbar(canvas_frame, orient=VERTICAL, command=self.preview_canvas.yview)
+        
+        self.preview_canvas.configure(xscrollcommand=h_scrollbar.set, yscrollcommand=v_scrollbar.set)
+        
+        # Grid layout for canvas and scrollbars
+        self.preview_canvas.grid(row=0, column=0, sticky='nsew')
+        h_scrollbar.grid(row=1, column=0, sticky='ew')
+        v_scrollbar.grid(row=0, column=1, sticky='ns')
+        
+        canvas_frame.grid_rowconfigure(0, weight=1)
+        canvas_frame.grid_columnconfigure(0, weight=1)
+        
+        # Bind mouse wheel for scrolling
+        self.preview_canvas.bind('<MouseWheel>', self._on_mousewheel)
+        self.preview_canvas.bind('<Shift-MouseWheel>', self._on_shift_mousewheel)
 
         # Info label below preview
-        self.info_label = Label(left_frame, text="Ready", bg='lightgray', font=('Arial', 10))
+        self.info_label = Label(left_frame, text="Ready | Select preview resolution from dropdown", bg='lightgray', font=('Arial', 10))
         self.info_label.pack(fill=X, pady=2)
 
         # Right panel - Controls
@@ -170,6 +231,14 @@ class JetsonSkyGUI:
             bg='lightgray', length=250
         )
         self.exposure_scale.pack(fill=X, padx=5)
+        
+        # Auto Exposure checkbox
+        self.auto_exposure_var = IntVar(value=0)
+        auto_exp_check = Checkbutton(
+            frame, text="Auto Exposure", variable=self.auto_exposure_var,
+            command=self.on_auto_exposure_toggle, bg='lightgray'
+        )
+        auto_exp_check.pack(anchor=W, padx=5)
 
         # Gain control
         Label(frame, text="Gain", bg='lightgray').pack(anchor=W, padx=5)
@@ -180,6 +249,14 @@ class JetsonSkyGUI:
             bg='lightgray', length=250
         )
         self.gain_scale.pack(fill=X, padx=5)
+        
+        # Auto Gain checkbox
+        self.auto_gain_var = IntVar(value=0)
+        auto_gain_check = Checkbutton(
+            frame, text="Auto Gain", variable=self.auto_gain_var,
+            command=self.on_auto_gain_toggle, bg='lightgray'
+        )
+        auto_gain_check.pack(anchor=W, padx=5)
 
         # USB Bandwidth
         Label(frame, text="USB Bandwidth", bg='lightgray').pack(anchor=W, padx=5)
@@ -201,6 +278,33 @@ class JetsonSkyGUI:
         Radiobutton(bin_frame, text="BIN 2", variable=self.bin_var, value=2,
                    command=self.on_bin_change, bg='lightgray').pack(side=LEFT)
 
+        # Preview Resolution selector
+        Label(frame, text="Preview Resolution", bg='lightgray').pack(anchor=W, padx=5, pady=(10, 0))
+        
+        from tkinter import ttk
+        self.resolution_var = StringVar(value="1920x1440")
+        resolution_options = [
+            "1280x720 (720p)",
+            "1280x960 (4:3)",
+            "1600x1200 (UXGA)",
+            "1920x1080 (1080p)",
+            "1920x1440 (Default)",
+            "2560x1440 (1440p)",
+            "2560x1920 (4:3)",
+            "3840x2160 (4K)",
+            "Full Resolution"
+        ]
+        
+        self.resolution_combo = ttk.Combobox(
+            frame, 
+            textvariable=self.resolution_var,
+            values=resolution_options,
+            state='readonly',
+            width=18
+        )
+        self.resolution_combo.pack(fill=X, padx=5, pady=2)
+        self.resolution_combo.bind('<<ComboboxSelected>>', self.on_resolution_change)
+
     def create_filter_controls(self, parent):
         """Create filter control widgets."""
         frame = LabelFrame(parent, text="Filters", bg='lightgray', font=('Arial', 10, 'bold'))
@@ -216,6 +320,7 @@ class JetsonSkyGUI:
             ('KNN Denoise', 'knn'),
             ('NLM2 Denoise', 'nlm2'),
             ('Saturation', 'saturation'),
+            ('Stabilization', 'stabilization'),
             ('Flip V', 'flip_v'),
             ('Flip H', 'flip_h'),
         ]
@@ -349,8 +454,10 @@ class JetsonSkyGUI:
                 self.camera.set_gain(self.gain_var.get())
                 self.camera.set_usb_bandwidth(self.usb_var.get())
 
-                # Update processor color mode
-                self.processor.is_color = self.camera.is_color
+                # Update processor color mode based on camera config
+                is_color = hasattr(self.camera, 'camera_config') and \
+                          self.camera.camera_config.bayer_pattern != "MONO"
+                self.processor.is_color = is_color
 
                 # Enable buttons
                 self.btn_start.config(state=NORMAL)
@@ -418,12 +525,18 @@ class JetsonSkyGUI:
             frame, is_new = self.camera.get_frame()
 
             if is_new and frame is not None:
-                # Process frame through filter pipeline
+                # Process frame through filter pipeline first (debayer, etc.)
                 processed_frame, metadata = self.processor.process_frame(
                     frame,
                     is_16bit=self.camera.use_16bit,
                     apply_debayer=self.camera.is_color
                 )
+                
+                # Apply stabilization if enabled (after debayering/processing)
+                if self.flag_stab and processed_frame is not None:
+                    # Determine if color or mono
+                    dim = 3 if len(processed_frame.shape) == 3 and processed_frame.shape[2] == 3 else 1
+                    processed_frame = self.template_tracking(processed_frame, dim)
 
                 # Apply AI detection if enabled
                 if self.ai_detector:
@@ -460,15 +573,37 @@ class JetsonSkyGUI:
                 # Convert to display format
                 display_frame = self.prepare_display_frame(processed_frame)
 
-                # Update preview
-                photo = PIL.ImageTk.PhotoImage(image=display_frame)
-                self.preview_label.config(image=photo)
-                self.preview_label.image = photo
+                # Update preview on canvas
+                self.photo_image = PIL.ImageTk.PhotoImage(image=display_frame)
+                
+                # Create or update canvas image
+                if self.canvas_image_id is None:
+                    self.canvas_image_id = self.preview_canvas.create_image(
+                        0, 0, anchor='nw', image=self.photo_image
+                    )
+                else:
+                    self.preview_canvas.itemconfig(self.canvas_image_id, image=self.photo_image)
 
-                # Update info
+                # Update info label with all details
                 fps = 1000.0 / metadata['processing_time_ms'] if metadata['processing_time_ms'] > 0 else 0
-                info_text = f"Processing: {metadata['processing_time_ms']:.1f}ms | FPS: {fps:.1f} | Filters: {metadata['filters_applied']}"
+                
+                # Get frame dimensions
+                if self.full_frame is not None:
+                    orig_h, orig_w = self.full_frame.shape[:2]
+                else:
+                    orig_h, orig_w = processed_frame.shape[:2]
+                
+                # Get display dimensions from PhotoImage
+                disp_w = display_frame.width
+                disp_h = display_frame.height
+                
+                info_text = (f"Camera: {orig_w}x{orig_h} | Preview: {disp_w}x{disp_h} | "
+                            f"{metadata['processing_time_ms']:.1f}ms | FPS: {fps:.1f} | "
+                            f"Filters: {metadata['filters_applied']}")
                 self.info_label.config(text=info_text)
+                
+                # Update sliders if auto mode is enabled (read back from camera)
+                self.update_auto_controls()
 
         except Exception as e:
             print(f"Preview error: {e}")
@@ -480,38 +615,124 @@ class JetsonSkyGUI:
             self.root.after(10, self.update_preview)
 
     def prepare_display_frame(self, frame):
-        """Prepare frame for display (resize and convert)."""
+        """Prepare frame for display - resize to fit selected preview resolution."""
         # Convert to RGB if grayscale
         if len(frame.shape) == 2:
             frame = cv2.cvtColor(frame, cv2.COLOR_GRAY2RGB)
         else:
             frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
 
-        # Resize to display size
+        # Store full resolution frame
+        self.full_frame = frame.copy()
+        
         h, w = frame.shape[:2]
         aspect = w / h
-
+        
+        # Always resize to fit within the display resolution while maintaining aspect ratio
         if aspect > self.display_width / self.display_height:
+            # Width is the limiting factor
             new_w = self.display_width
             new_h = int(new_w / aspect)
         else:
+            # Height is the limiting factor
             new_h = self.display_height
             new_w = int(new_h * aspect)
-
+        
+        # Resize frame to fit display resolution
         frame_resized = cv2.resize(frame, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
-
-        # Convert to PIL Image
-        return PIL.Image.fromarray(frame_resized)
+        pil_image = PIL.Image.fromarray(frame_resized)
+        
+        # Update canvas scroll region to match resized frame (no scrolling needed)
+        self.preview_canvas.configure(scrollregion=(0, 0, new_w, new_h))
+        
+        # Update info label with original and display resolutions
+        # (Only update resolution info, preserve FPS info if it exists)
+        
+        return pil_image
 
     def on_exposure_change(self, value):
-        """Handle exposure slider change."""
+        """Handle exposure slider change (user manual adjustment)."""
         if self.camera and self.camera.is_initialized:
-            self.camera.set_exposure(int(value))
+            # Disable auto exposure if manual change
+            if self.auto_exposure_var.get() == 1:
+                self.auto_exposure_var.set(0)
+                print("✓ Auto Exposure disabled - manual adjustment")
+            self.camera.set_exposure(int(value), auto=False)
 
     def on_gain_change(self, value):
-        """Handle gain slider change."""
+        """Handle gain slider change (user manual adjustment)."""
         if self.camera and self.camera.is_initialized:
-            self.camera.set_gain(int(value))
+            # Disable auto gain if manual change
+            if self.auto_gain_var.get() == 1:
+                self.auto_gain_var.set(0)
+                print("✓ Auto Gain disabled - manual adjustment")
+            self.camera.set_gain(int(value), auto=False)
+
+    def on_auto_exposure_toggle(self):
+        """Handle auto exposure checkbox toggle."""
+        if not self.camera or not self.camera.is_initialized:
+            return
+        
+        auto_enabled = self.auto_exposure_var.get() == 1
+        
+        if auto_enabled:
+            # Enable auto exposure
+            self.camera.set_exposure(self.exposure_var.get(), auto=True)
+            # Don't disable slider - let it show the auto-adjusted value
+            print("✓ Auto Exposure enabled")
+        else:
+            # Disable auto exposure, set manual value
+            self.camera.set_exposure(self.exposure_var.get(), auto=False)
+            print("✓ Auto Exposure disabled - manual control")
+
+    def on_auto_gain_toggle(self):
+        """Handle auto gain checkbox toggle."""
+        if not self.camera or not self.camera.is_initialized:
+            return
+        
+        auto_enabled = self.auto_gain_var.get() == 1
+        
+        if auto_enabled:
+            # Enable auto gain
+            self.camera.set_gain(self.gain_var.get(), auto=True)
+            # Don't disable slider - let it show the auto-adjusted value
+            print("✓ Auto Gain enabled")
+        else:
+            # Disable auto gain, set manual value
+            self.camera.set_gain(self.gain_var.get(), auto=False)
+            print("✓ Auto Gain disabled - manual control")
+
+    def update_auto_controls(self):
+        """Update sliders with current camera values when in auto mode."""
+        if not self.camera or not self.camera.is_initialized:
+            return
+        
+        try:
+            # Update exposure slider if auto exposure is enabled
+            if self.auto_exposure_var.get() == 1:
+                current_exposure = self.camera.get_control_value(asi.ASI_EXPOSURE)
+                if current_exposure:
+                    # Convert from microseconds to display value
+                    exposure_val = int(current_exposure[0])
+                    # Temporarily disable command, update value, then restore
+                    old_command = self.exposure_scale.cget('command')
+                    self.exposure_scale.config(command='')
+                    self.exposure_scale.set(exposure_val)
+                    self.exposure_scale.config(command=old_command)
+            
+            # Update gain slider if auto gain is enabled
+            if self.auto_gain_var.get() == 1:
+                current_gain = self.camera.get_control_value(asi.ASI_GAIN)
+                if current_gain:
+                    gain_val = int(current_gain[0])
+                    # Temporarily disable command, update value, then restore
+                    old_command = self.gain_scale.cget('command')
+                    self.gain_scale.config(command='')
+                    self.gain_scale.set(gain_val)
+                    self.gain_scale.config(command=old_command)
+                    
+        except Exception as e:
+            pass  # Silently ignore errors to avoid spamming console
 
     def on_usb_change(self, value):
         """Handle USB bandwidth slider change."""
@@ -524,12 +745,221 @@ class JetsonSkyGUI:
             # Would need to stop/restart acquisition to change binning
             print(f"Binning mode changed to {self.bin_var.get()}")
 
+    def on_resolution_change(self, event=None):
+        """Handle preview resolution change."""
+        resolution_str = self.resolution_var.get()
+        
+        # Parse resolution from string
+        if "Full Resolution" in resolution_str:
+            # Use camera's full resolution
+            if self.camera and hasattr(self.camera, 'resolution_x'):
+                self.display_width = self.camera.resolution_x
+                self.display_height = self.camera.resolution_y
+                print(f"Preview resolution set to Full: {self.display_width}x{self.display_height}")
+            else:
+                # Default to 4K if camera not initialized
+                self.display_width = 3840
+                self.display_height = 2160
+                print(f"Preview resolution set to Full (default 4K): {self.display_width}x{self.display_height}")
+        else:
+            # Extract WxH from string like "1920x1080 (1080p)"
+            try:
+                resolution_part = resolution_str.split()[0]  # Get "1920x1080" part
+                width, height = map(int, resolution_part.split('x'))
+                self.display_width = width
+                self.display_height = height
+                print(f"Preview resolution changed to: {self.display_width}x{self.display_height}")
+            except Exception as e:
+                print(f"Error parsing resolution: {e}")
+                return
+        
+        # Update info label
+        self.info_label.config(
+            text=f"Preview resolution set to: {self.display_width}x{self.display_height}"
+        )
+        
+        # Force canvas resize to new dimensions
+        self.preview_canvas.config(width=self.display_width, height=self.display_height)
+        
+        # If preview is active, the next frame will use the new dimensions
+        # The update_preview loop will automatically resize the video feed
+
+    def template_tracking(self, image, dim):
+        """
+        Stabilize image using template matching (exact port from V53_07RC).
+        
+        Args:
+            image: Input image (color or grayscale) - can be NumPy or CuPy array
+            dim: 3 for color, 1 for grayscale
+            
+        Returns:
+            Stabilized image (same type as input)
+        """
+        if not self.camera:
+            return image
+        
+        # Convert CuPy array to NumPy if needed
+        import cupy as cp
+        is_cupy = isinstance(image, cp.ndarray)
+        if is_cupy:
+            image = cp.asnumpy(image)
+            
+        res_cam_x = self.camera.resolution_x
+        res_cam_y = self.camera.resolution_y
+        
+        # Save old values for bounds checking
+        old_tx = self.delta_tx
+        old_ty = self.delta_ty
+        
+        # Keyboard commands would be handled here (placeholder for future)
+        # In original: STAB_UP, STAB_DOWN, STAB_LEFT, STAB_RIGHT, STAB_ZONE_MORE, STAB_ZONE_LESS
+        
+        # Clamp DSW range
+        if self.dsw > 12:
+            self.dsw = 12
+        if self.dsw < 0:
+            self.dsw = 0
+        
+        if not self.flag_template:
+            # Initialize template from center region (exact logic from V53_07RC)
+            if res_cam_x > 1500:
+                rs = res_cam_y // 2 - res_cam_y // (8 + self.dsw) + self.delta_ty
+                re = res_cam_y // 2 + res_cam_y // (8 + self.dsw) + self.delta_ty
+                cs = res_cam_x // 2 - res_cam_x // (8 + self.dsw) + self.delta_tx
+                ce = res_cam_x // 2 + res_cam_x // (8 + self.dsw) + self.delta_tx
+                # Bounds checking with restoration of old values
+                if cs < 30 or ce > (res_cam_x - 30):
+                    self.delta_tx = old_tx
+                    cs = res_cam_x // 2 - res_cam_x // (8 + self.dsw) + self.delta_tx
+                    ce = res_cam_x // 2 + res_cam_x // (8 + self.dsw) + self.delta_tx
+                if rs < 30 or re > (res_cam_y - 30):
+                    self.delta_ty = old_ty
+                    rs = res_cam_y // 2 - res_cam_y // (8 + self.dsw) + self.delta_ty
+                    re = res_cam_y // 2 + res_cam_y // (8 + self.dsw) + self.delta_ty
+            else:
+                rs = res_cam_y // 2 - res_cam_y // (3 + self.dsw) + self.delta_ty
+                re = res_cam_y // 2 + res_cam_y // (3 + self.dsw) + self.delta_ty
+                cs = res_cam_x // 2 - res_cam_x // (3 + self.dsw) + self.delta_tx
+                ce = res_cam_x // 2 + res_cam_x // (3 + self.dsw) + self.delta_tx
+                # Bounds checking with restoration of old values
+                if cs < 30 or ce > (res_cam_x - 30):
+                    self.delta_tx = old_tx
+                    cs = res_cam_x // 2 - res_cam_x // (3 + self.dsw) + self.delta_tx
+                    ce = res_cam_x // 2 + res_cam_x // (3 + self.dsw) + self.delta_tx
+                if rs < 30 or re > (res_cam_y - 30):
+                    self.delta_ty = old_ty
+                    rs = res_cam_y // 2 - res_cam_y // (3 + self.dsw) + self.delta_ty
+                    re = res_cam_y // 2 + res_cam_y // (3 + self.dsw) + self.delta_ty
+            
+            self.stab_start_point = (cs, rs)
+            self.stab_end_point = (ce, re)
+            
+            # Extract template
+            self.template = image[rs:re, cs:ce].copy()
+            if dim == 3:
+                self.template = cv2.cvtColor(self.template, cv2.COLOR_BGR2GRAY)
+            else:
+                pass  # Mono image, use as is
+            
+            # Ensure template is uint8
+            if self.template.dtype != np.uint8:
+                self.template = np.clip(self.template, 0, 255).astype(np.uint8)
+            
+            # Note: OpenCV CUDA template matching not implemented in refactored version
+            # Would require flag_OpenCvCuda setup
+            
+            self.flag_template = True
+            new_image = image
+            self.flag_new_stab_window = True
+            # Convert back to CuPy if original was CuPy
+            if is_cupy:
+                new_image = cp.asarray(new_image)
+            return new_image
+        else:
+            # Template exists, perform tracking
+            self.flag_new_stab_window = False
+            
+            # Convert image to grayscale if needed (exact logic from V53_07RC)
+            if dim == 3:
+                imageGray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+            else:
+                imageGray = image
+            
+            # Ensure both images are uint8 for template matching
+            if imageGray.dtype != np.uint8:
+                imageGray = np.clip(imageGray, 0, 255).astype(np.uint8)
+            if self.template.dtype != np.uint8:
+                self.template = np.clip(self.template, 0, 255).astype(np.uint8)
+            
+            # Perform template matching (CPU version - CUDA version not implemented)
+            result = cv2.matchTemplate(imageGray, self.template, cv2.TM_CCOEFF_NORMED)
+            (minVal, maxVal, minLoc, maxLoc) = cv2.minMaxLoc(result)
+            
+            if maxVal > 0.2:  # Confidence threshold (same as original)
+                try:
+                    # Calculate stabilization offset (exact logic from V53_07RC)
+                    width = int(image.shape[1] * 2)
+                    height = int(image.shape[0] * 2)
+                    
+                    if dim == 3:
+                        tmp_image = np.zeros((height, width, 3), np.uint8)
+                    else:
+                        tmp_image = np.zeros((height, width), np.uint8)
+                    
+                    (startX, startY) = maxLoc
+                    midX = startX + self.template.shape[1] // 2
+                    midY = startY + self.template.shape[0] // 2
+                    
+                    DeltaX = image.shape[1] // 2 + self.delta_tx - midX
+                    DeltaY = image.shape[0] // 2 + self.delta_ty - midY
+                    
+                    # Apply stabilization shift (exact coordinates from V53_07RC)
+                    rs = int(res_cam_y / 4 + DeltaY)  # Y up
+                    re = int(rs + res_cam_y)           # Y down
+                    cs = int(res_cam_x / 4 + DeltaX)  # X left
+                    ce = int(cs + res_cam_x)           # X right
+                    tmp_image[rs:re, cs:ce] = image
+                    
+                    rs = res_cam_y // 4                # Y up
+                    re = res_cam_y // 4 + res_cam_y   # Y down
+                    cs = res_cam_x // 4                # X left
+                    ce = res_cam_x // 4 + res_cam_x   # X right
+                    new_image = tmp_image[rs:re, cs:ce]
+                    
+                    # Convert back to CuPy if original was CuPy
+                    if is_cupy:
+                        new_image = cp.asarray(new_image)
+                    return new_image
+                except:
+                    # Silent failure like original
+                    new_image = image
+                    if is_cupy:
+                        new_image = cp.asarray(new_image)
+                    return new_image
+            else:
+                # Match confidence too low, return original
+                new_image = image
+                if is_cupy:
+                    new_image = cp.asarray(new_image)
+                return new_image
+
     def on_filter_toggle(self, filter_key):
         """Handle filter enable/disable toggle."""
         if not self.processor:
             return
 
         enabled = self.filter_vars[filter_key].get()
+        
+        # Handle stabilization separately
+        if filter_key == 'stabilization':
+            self.flag_stab = enabled
+            # Reset template when toggling stabilization
+            self.flag_template = False
+            self.delta_tx = 0
+            self.delta_ty = 0
+            self.dsw = 0
+            print(f"Stabilization: {'ON' if enabled else 'OFF'}")
+            return
 
         # Map GUI keys to filter names
         filter_map = {
@@ -634,6 +1064,14 @@ class JetsonSkyGUI:
 
         except Exception as e:
             print(f"✗ Failed to stop video capture: {e}")
+
+    def _on_mousewheel(self, event):
+        """Handle vertical mouse wheel scrolling."""
+        self.preview_canvas.yview_scroll(-1 * int(event.delta / 120), "units")
+
+    def _on_shift_mousewheel(self, event):
+        """Handle horizontal mouse wheel scrolling (Shift + wheel)."""
+        self.preview_canvas.xview_scroll(-1 * int(event.delta / 120), "units")
 
     def on_closing(self):
         """Handle window close event."""
