@@ -39,6 +39,8 @@ from .constants import (
     SATELLITES_TRACKER_CONFIG_PATH,
 )
 
+from .stabilization import ImageStabilizer
+
 __all__ = [
     # Color constants
     'COLOR_TURQUOISE',
@@ -72,4 +74,6 @@ __all__ = [
     'MOON_CRATER_MODEL_PATH',
     'SATELLITES_MODEL_PATH',
     'SATELLITES_TRACKER_CONFIG_PATH',
+    # Stabilization
+    'ImageStabilizer',
 ]

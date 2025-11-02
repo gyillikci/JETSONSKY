@@ -66,6 +66,7 @@ else:
     print("Warning: CaptureManager not available")
     CaptureManager = None
 from ai import AIDetector
+from utils import ImageStabilizer
 
 # Configure paths
 if my_os == "linux":
@@ -111,6 +112,7 @@ class JetsonSkyGUI:
         self.processor = None
         self.capture_manager = None
         self.ai_detector = None
+        self.stabilizer = None  # Will be initialized after camera
 
         # Application state
         self.app_state = AppState()
@@ -120,31 +122,14 @@ class JetsonSkyGUI:
         # Display settings
         self.display_width = 1920
         self.display_height = 1440
-        
+
         # Scrollable canvas settings
         self.full_frame = None  # Store full resolution frame
         self.photo_image = None  # Keep reference to PhotoImage
         self.canvas_image_id = None  # Canvas image item id
-        
+
         # Auto control flags to prevent circular triggers
         self.updating_auto_controls = False
-        
-        # Stabilization variables
-        self.flag_stab = False
-        self.flag_template = False
-        self.template = None
-        self.delta_tx = 0
-        self.delta_ty = 0
-        self.dsw = 0  # Stabilization window size adjustment
-        self.stab_start_point = (0, 0)
-        self.stab_end_point = (0, 0)
-        self.flag_new_stab_window = False
-        
-        # OpenCV CUDA template matching objects (if available)
-        self.gsrc = None
-        self.gtmpl = None
-        self.gresult = None
-        self.matcher = None
 
         # Build GUI
         self.create_widgets()
@@ -459,6 +444,13 @@ class JetsonSkyGUI:
                           self.camera.camera_config.bayer_pattern != "MONO"
                 self.processor.is_color = is_color
 
+                # Initialize stabilizer with camera resolution
+                self.stabilizer = ImageStabilizer(
+                    resolution_x=self.camera.resolution_x,
+                    resolution_y=self.camera.resolution_y
+                )
+                print("✓ ImageStabilizer initialized")
+
                 # Enable buttons
                 self.btn_start.config(state=NORMAL)
                 self.btn_init.config(state=DISABLED)
@@ -533,10 +525,10 @@ class JetsonSkyGUI:
                 )
                 
                 # Apply stabilization if enabled (after debayering/processing)
-                if self.flag_stab and processed_frame is not None:
+                if self.stabilizer and self.stabilizer.enabled and processed_frame is not None:
                     # Determine if color or mono
-                    dim = 3 if len(processed_frame.shape) == 3 and processed_frame.shape[2] == 3 else 1
-                    processed_frame = self.template_tracking(processed_frame, dim)
+                    is_color = len(processed_frame.shape) == 3 and processed_frame.shape[2] == 3
+                    processed_frame = self.stabilizer.stabilize(processed_frame, is_color=is_color)
 
                 # Apply AI detection if enabled
                 if self.ai_detector:
@@ -784,165 +776,6 @@ class JetsonSkyGUI:
         # If preview is active, the next frame will use the new dimensions
         # The update_preview loop will automatically resize the video feed
 
-    def template_tracking(self, image, dim):
-        """
-        Stabilize image using template matching (exact port from V53_07RC).
-        
-        Args:
-            image: Input image (color or grayscale) - can be NumPy or CuPy array
-            dim: 3 for color, 1 for grayscale
-            
-        Returns:
-            Stabilized image (same type as input)
-        """
-        if not self.camera:
-            return image
-        
-        # Convert CuPy array to NumPy if needed
-        import cupy as cp
-        is_cupy = isinstance(image, cp.ndarray)
-        if is_cupy:
-            image = cp.asnumpy(image)
-            
-        res_cam_x = self.camera.resolution_x
-        res_cam_y = self.camera.resolution_y
-        
-        # Save old values for bounds checking
-        old_tx = self.delta_tx
-        old_ty = self.delta_ty
-        
-        # Keyboard commands would be handled here (placeholder for future)
-        # In original: STAB_UP, STAB_DOWN, STAB_LEFT, STAB_RIGHT, STAB_ZONE_MORE, STAB_ZONE_LESS
-        
-        # Clamp DSW range
-        if self.dsw > 12:
-            self.dsw = 12
-        if self.dsw < 0:
-            self.dsw = 0
-        
-        if not self.flag_template:
-            # Initialize template from center region (exact logic from V53_07RC)
-            if res_cam_x > 1500:
-                rs = res_cam_y // 2 - res_cam_y // (8 + self.dsw) + self.delta_ty
-                re = res_cam_y // 2 + res_cam_y // (8 + self.dsw) + self.delta_ty
-                cs = res_cam_x // 2 - res_cam_x // (8 + self.dsw) + self.delta_tx
-                ce = res_cam_x // 2 + res_cam_x // (8 + self.dsw) + self.delta_tx
-                # Bounds checking with restoration of old values
-                if cs < 30 or ce > (res_cam_x - 30):
-                    self.delta_tx = old_tx
-                    cs = res_cam_x // 2 - res_cam_x // (8 + self.dsw) + self.delta_tx
-                    ce = res_cam_x // 2 + res_cam_x // (8 + self.dsw) + self.delta_tx
-                if rs < 30 or re > (res_cam_y - 30):
-                    self.delta_ty = old_ty
-                    rs = res_cam_y // 2 - res_cam_y // (8 + self.dsw) + self.delta_ty
-                    re = res_cam_y // 2 + res_cam_y // (8 + self.dsw) + self.delta_ty
-            else:
-                rs = res_cam_y // 2 - res_cam_y // (3 + self.dsw) + self.delta_ty
-                re = res_cam_y // 2 + res_cam_y // (3 + self.dsw) + self.delta_ty
-                cs = res_cam_x // 2 - res_cam_x // (3 + self.dsw) + self.delta_tx
-                ce = res_cam_x // 2 + res_cam_x // (3 + self.dsw) + self.delta_tx
-                # Bounds checking with restoration of old values
-                if cs < 30 or ce > (res_cam_x - 30):
-                    self.delta_tx = old_tx
-                    cs = res_cam_x // 2 - res_cam_x // (3 + self.dsw) + self.delta_tx
-                    ce = res_cam_x // 2 + res_cam_x // (3 + self.dsw) + self.delta_tx
-                if rs < 30 or re > (res_cam_y - 30):
-                    self.delta_ty = old_ty
-                    rs = res_cam_y // 2 - res_cam_y // (3 + self.dsw) + self.delta_ty
-                    re = res_cam_y // 2 + res_cam_y // (3 + self.dsw) + self.delta_ty
-            
-            self.stab_start_point = (cs, rs)
-            self.stab_end_point = (ce, re)
-            
-            # Extract template
-            self.template = image[rs:re, cs:ce].copy()
-            if dim == 3:
-                self.template = cv2.cvtColor(self.template, cv2.COLOR_BGR2GRAY)
-            else:
-                pass  # Mono image, use as is
-            
-            # Ensure template is uint8
-            if self.template.dtype != np.uint8:
-                self.template = np.clip(self.template, 0, 255).astype(np.uint8)
-            
-            # Note: OpenCV CUDA template matching not implemented in refactored version
-            # Would require flag_OpenCvCuda setup
-            
-            self.flag_template = True
-            new_image = image
-            self.flag_new_stab_window = True
-            # Convert back to CuPy if original was CuPy
-            if is_cupy:
-                new_image = cp.asarray(new_image)
-            return new_image
-        else:
-            # Template exists, perform tracking
-            self.flag_new_stab_window = False
-            
-            # Convert image to grayscale if needed (exact logic from V53_07RC)
-            if dim == 3:
-                imageGray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-            else:
-                imageGray = image
-            
-            # Ensure both images are uint8 for template matching
-            if imageGray.dtype != np.uint8:
-                imageGray = np.clip(imageGray, 0, 255).astype(np.uint8)
-            if self.template.dtype != np.uint8:
-                self.template = np.clip(self.template, 0, 255).astype(np.uint8)
-            
-            # Perform template matching (CPU version - CUDA version not implemented)
-            result = cv2.matchTemplate(imageGray, self.template, cv2.TM_CCOEFF_NORMED)
-            (minVal, maxVal, minLoc, maxLoc) = cv2.minMaxLoc(result)
-            
-            if maxVal > 0.2:  # Confidence threshold (same as original)
-                try:
-                    # Calculate stabilization offset (exact logic from V53_07RC)
-                    width = int(image.shape[1] * 2)
-                    height = int(image.shape[0] * 2)
-                    
-                    if dim == 3:
-                        tmp_image = np.zeros((height, width, 3), np.uint8)
-                    else:
-                        tmp_image = np.zeros((height, width), np.uint8)
-                    
-                    (startX, startY) = maxLoc
-                    midX = startX + self.template.shape[1] // 2
-                    midY = startY + self.template.shape[0] // 2
-                    
-                    DeltaX = image.shape[1] // 2 + self.delta_tx - midX
-                    DeltaY = image.shape[0] // 2 + self.delta_ty - midY
-                    
-                    # Apply stabilization shift (exact coordinates from V53_07RC)
-                    rs = int(res_cam_y / 4 + DeltaY)  # Y up
-                    re = int(rs + res_cam_y)           # Y down
-                    cs = int(res_cam_x / 4 + DeltaX)  # X left
-                    ce = int(cs + res_cam_x)           # X right
-                    tmp_image[rs:re, cs:ce] = image
-                    
-                    rs = res_cam_y // 4                # Y up
-                    re = res_cam_y // 4 + res_cam_y   # Y down
-                    cs = res_cam_x // 4                # X left
-                    ce = res_cam_x // 4 + res_cam_x   # X right
-                    new_image = tmp_image[rs:re, cs:ce]
-                    
-                    # Convert back to CuPy if original was CuPy
-                    if is_cupy:
-                        new_image = cp.asarray(new_image)
-                    return new_image
-                except:
-                    # Silent failure like original
-                    new_image = image
-                    if is_cupy:
-                        new_image = cp.asarray(new_image)
-                    return new_image
-            else:
-                # Match confidence too low, return original
-                new_image = image
-                if is_cupy:
-                    new_image = cp.asarray(new_image)
-                return new_image
-
     def on_filter_toggle(self, filter_key):
         """Handle filter enable/disable toggle."""
         if not self.processor:
@@ -952,13 +785,11 @@ class JetsonSkyGUI:
         
         # Handle stabilization separately
         if filter_key == 'stabilization':
-            self.flag_stab = enabled
-            # Reset template when toggling stabilization
-            self.flag_template = False
-            self.delta_tx = 0
-            self.delta_ty = 0
-            self.dsw = 0
-            print(f"Stabilization: {'ON' if enabled else 'OFF'}")
+            if self.stabilizer:
+                if enabled:
+                    self.stabilizer.enable()
+                else:
+                    self.stabilizer.disable()
             return
 
         # Map GUI keys to filter names
