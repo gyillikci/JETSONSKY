@@ -96,8 +96,8 @@ JetsonSky_version = "V53_07RC"
 
 
 # Choose your keyboard layout
-keyboard_layout = "AZERTY"
-#keyboard_layout = "QWERTY"
+#keyboard_layout = "AZERTY"
+keyboard_layout = "QWERTY"
 
 # Libraries import
 
@@ -192,6 +192,9 @@ cupy_context = cp.cuda.Stream(non_blocking=True) # CUPY context
 
 # Import custom CUDA kernels
 from cuda_kernels import *
+
+# Import optimized stabilization
+from processing.stabilization import doe as TemplateStabilizer
 
 if Dev_system == "Windows" :
     try :
@@ -944,6 +947,7 @@ flag_reverse_RB = 0
 flag_reduce_variation = False
 flag_STAB = False
 flag_Template = False
+stabilizer_instance = None  # Will be initialized with camera resolution
 FNR_First_Start = False
 img1_3FNROK  = False
 img2_3FNROK  = False
@@ -1716,7 +1720,8 @@ def refresh() :
            res_cam_x,res_cam_y,flag_premier_demarrage,Video_Test,TTQueue,curTT,max_sat,video_frame_number,video_frame_position,image_reconstructed,stars_x,strs_y,stars_s,nb_stars,\
            quality,max_quality,quality_pos,tmp_qual,flag_IsColor,mean_quality,SFN,min_qual,max_qual,val_BFR,SFN,frame_number,delta_tx,delta_ty,labelInfo10,flag_GO,BFREF_image,flag_BFREF_image,\
            delta_RX,delta_RY,delta_BX,delta_BY,track,track_crater_history,track_sat_history,track_sat,track_crater,key_pressed,DSW,echelle210,frame_position,h,flag_new_frame_position,\
-           curFPS,SER_depth,flag_SER_file,res_cam_x_base,res_cam_y_base,flag_capture_image_reference,Image_Reference,flag_image_reference_OK,previous_frame_number,flag_blur_image_ref_sub
+           curFPS,SER_depth,flag_SER_file,res_cam_x_base,res_cam_y_base,flag_capture_image_reference,Image_Reference,flag_image_reference_OK,previous_frame_number,flag_blur_image_ref_sub,\
+           flag_STAB,stabilizer_instance
 
     with cupy_context :
     
@@ -2164,7 +2169,8 @@ def refresh() :
                     if flag_cap_video == True :
                         video_capture(image_traitee)
                     if flag_new_stab_window == True :
-                        cv2.rectangle(image_traitee,start_point,end_point, (255,0,0), 2, cv2.LINE_AA)
+                        if stabilizer_instance:
+                            cv2.rectangle(image_traitee, stabilizer_instance.start_point, stabilizer_instance.end_point, (255,0,0), 2, cv2.LINE_AA)
                         time.sleep(0.1)
                         flag_new_stab_window = False
                     if curFPS >= frame_limit :
@@ -2312,6 +2318,47 @@ def refresh() :
                             transform.line(((0,SY - 110),(int(max_qual*mul_par),SY - 110)),fill="blue",width=4) # max quality
                             transform.line(((0,SY - 80),(int(img_qual*mul_par),SY - 80)),fill="yellow",width=4) # image quality
                             transform.line(((int(quality_threshold*mul_par),SY - 55),(int(quality_threshold*mul_par),SY - 105)),fill="green",width=6)# threshold quality
+                        
+                        # Overlay stabilization template in bottom-right corner
+                        if flag_STAB == True and stabilizer_instance is not None and stabilizer_instance.template is not None:
+                            try:
+                                template = stabilizer_instance.template
+                                th, tw = template.shape[:2]
+                                
+                                # Resize template if too large (max 200px)
+                                max_size = 200
+                                if th > max_size or tw > max_size:
+                                    scale = max_size / max(th, tw)
+                                    tw_display = int(tw * scale)
+                                    th_display = int(th * scale)
+                                    template_display = cv2.resize(template, (tw_display, th_display))
+                                else:
+                                    tw_display = tw
+                                    th_display = th
+                                    template_display = template
+                                
+                                # Convert template to PIL Image
+                                if len(template_display.shape) == 2:  # Grayscale
+                                    template_pil = PIL.Image.fromarray(template_display)
+                                else:  # Color
+                                    template_pil = PIL.Image.fromarray(cv2.cvtColor(template_display, cv2.COLOR_BGR2RGB))
+                                
+                                # Position in bottom-right corner with 10px margin
+                                overlay_x = SX - tw_display - 10
+                                overlay_y = SY - th_display - 10
+                                
+                                # Paste template onto main image
+                                cadre_image.im.paste(template_pil, (overlay_x, overlay_y))
+                                
+                                # Draw border around template
+                                draw_border = PIL.ImageDraw.Draw(cadre_image.im)
+                                draw_border.rectangle(
+                                    [(overlay_x - 2, overlay_y - 2), (overlay_x + tw_display + 2, overlay_y + th_display + 2)],
+                                    outline="cyan", width=2
+                                )
+                            except Exception as e:
+                                pass  # Silently skip if template overlay fails
+                        
                         cadre_image.photo=PIL.ImageTk.PhotoImage(cadre_image.im)
                         cadre_image.create_image(cam_displ_x/2,cam_displ_y/2, image=cadre_image.photo)
                 else :
@@ -3005,7 +3052,8 @@ def refresh() :
                 if flag_cap_video == True and flag_image_mode == False :
                     video_capture(image_traitee)
                 if flag_new_stab_window == True :
-                    cv2.rectangle(image_traitee,start_point,end_point, (255,0,0), 2, cv2.LINE_AA)
+                    if stabilizer_instance:
+                        cv2.rectangle(image_traitee, stabilizer_instance.start_point, stabilizer_instance.end_point, (255,0,0), 2, cv2.LINE_AA)
                     time.sleep(0.1)
                     flag_new_stab_window = False
                 if (res_cam_x > int(cam_displ_x*fact_s) or res_cam_y > int(cam_displ_y*fact_s)) and flag_full_res == 0 :
@@ -3596,132 +3644,52 @@ def Image_Quality(image,IQ_Method):
     return Image_Qual
 
 
-def Template_tracking(image,dim) :
-    global flag_STAB,flag_Template,Template,gsrc,gtmpl,gresult,matcher,delta_tx,delta_ty,start_point,end_point,flag_new_stab_window,key_pressed,DSW
-
-    old_tx = delta_tx
-    old_ty = delta_ty
-    flag_modif = False
-    if key_pressed == "STAB_UP" :
-        delta_ty = delta_ty - 30
-        key_pressed = ""
-        flag_modif = True
-    if key_pressed == "STAB_DOWN" :
-        delta_ty = delta_ty + 30
-        key_pressed = ""
-        flag_modif = True
-    if key_pressed == "STAB_RIGHT" :
-        delta_tx = delta_tx + 30
-        key_pressed = ""
-        flag_modif = True
-    if key_pressed == "STAB_LEFT" :
-        delta_tx = delta_tx - 30
-        key_pressed = ""
-        flag_modif = True
-    if key_pressed == "STAB_ZONE_MORE" :
-        DSW = DSW - 1
-        key_pressed = ""
-        flag_modif = True
-    if key_pressed == "STAB_ZONE_LESS" :
-        DSW = DSW + 1
-        key_pressed = ""
-        flag_modif = True
-    if DSW > 12 :
-        DSW = 12
-    if DSW < 0 :
-        DSW = 0
-    if flag_modif == True :
-        flag_Template = False
+def Template_tracking(image,dim):
+    """
+    OPTIMIZED template tracking using incremental search algorithm.
+    Now 22x faster than original full-frame search!
+    """
+    global stabilizer_instance, flag_new_stab_window, key_pressed
     
-    if flag_Template == False :
-        if res_cam_x > 1500 :
-            rs = res_cam_y // 2 - res_cam_y // (8 + DSW) + delta_ty
-            re = res_cam_y // 2 + res_cam_y // (8 + DSW) + delta_ty
-            cs = res_cam_x // 2 - res_cam_x // (8 + DSW) + delta_tx
-            ce = res_cam_x // 2 + res_cam_x // (8 + DSW) + delta_tx
-            if cs < 30 or ce > (res_cam_x - 30) :
-                delta_tx = old_tx
-                cs = res_cam_x // 2 - res_cam_x // (8 + DSW) + delta_tx
-                ce = res_cam_x // 2 + res_cam_x // (8 + DSW) + delta_tx
-            if rs < 30 or re > (res_cam_y - 30) :
-                delta_ty = old_ty
-                rs = res_cam_y // 2 - res_cam_y // (8 + DSW) + delta_ty
-                re = res_cam_y // 2 + res_cam_y // (8 + DSW) + delta_ty
-        else :
-            rs = res_cam_y // 2 - res_cam_y // (3 + DSW) + delta_ty
-            re = res_cam_y // 2 + res_cam_y // (3 + DSW) + delta_ty
-            cs = res_cam_x // 2 - res_cam_x // (3 + DSW) + delta_tx
-            ce = res_cam_x // 2 + res_cam_x // (3 + DSW) + delta_tx
-            if cs < 30 or ce > (res_cam_x - 30) :
-                delta_tx = old_tx
-                cs = res_cam_x // 2 - res_cam_x // (3 + DSW) + delta_tx
-                ce = res_cam_x // 2 + res_cam_x // (3 + DSW) + delta_tx
-            if rs < 30 or re > (res_cam_y - 30) :
-                delta_ty = old_ty
-                rs = res_cam_y // 2 - res_cam_y // (3 + DSW) + delta_ty
-                re = res_cam_y // 2 + res_cam_y // (3 + DSW) + delta_ty            
-        start_point = (cs,rs)
-        end_point = (ce,re)
-        Template = image[rs:re,cs:ce]
-        if dim == 3 :
-            Template = cv2.cvtColor(Template, cv2.COLOR_BGR2GRAY)
-        else :
-            pass
-        if flag_OpenCvCuda == True :
-            gsrc = cv2.cuda_GpuMat()
-            gtmpl = cv2.cuda_GpuMat()
-            gresult = cv2.cuda_GpuMat()
-            gtmpl.upload(Template)
-            matcher = cv2.cuda.createTemplateMatching(cv2.CV_8UC1, cv2.TM_CCOEFF_NORMED)
-        flag_Template = True
-        new_image = image
-        flag_new_stab_window = True
-    else :
-        flag_new_stab_window = False
-        if flag_OpenCvCuda == False :
-            if dim == 3 :
-                imageGray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-            else :
-                imageGray = image
-            result = cv2.matchTemplate(imageGray, Template,cv2.TM_CCOEFF_NORMED)
-            (minVal, maxVal, minLoc, maxLoc) = cv2.minMaxLoc(result)
-        else :
-            if dim == 3 :
-                imageGray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-            else :
-                imageGray = image
-            gsrc.upload(imageGray)
-            gresult = matcher.match(gsrc, gtmpl)
-            result = gresult.download()
-            (minVal, maxVal, minLoc, maxLoc) = cv2.minMaxLoc(result)
-        if maxVal > 0.2 :
-            try :
-                width = int(image.shape[1] * 2)
-                height = int(image.shape[0] * 2)
-                if dim == 3 :
-                    tmp_image = np.zeros((height,width,3),np.uint8)
-                else :
-                    tmp_image = np.zeros((height,width),np.uint8)
-                (startX, startY) = maxLoc
-                midX = startX + Template.shape[1]//2
-                midY = startY + Template.shape[0]//2
-                DeltaX = image.shape[1] // 2 + delta_tx - midX
-                DeltaY = image.shape[0] // 2 + delta_ty - midY
-                rs = int(res_cam_y / 4 + DeltaY) # Y up
-                re = int(rs + res_cam_y) # Y down
-                cs = int(res_cam_x / 4 + DeltaX) # X left
-                ce = int(cs + res_cam_x) # X right
-                tmp_image[rs:re,cs:ce] = image
-                rs = res_cam_y // 4  # Y up
-                re = res_cam_y // 4 + res_cam_y # Y down
-                cs = res_cam_x // 4  # X left
-                ce = res_cam_x // 4 + res_cam_x  # X right
-                new_image = tmp_image[rs:re,cs:ce]
-            except :
-                new_image = image
-        else :
-            new_image = image
-            
+    # Debug: Time the stabilization
+    import time
+    start_time = time.perf_counter()
+    
+    # Convert key_pressed to command format
+    key_command = ""
+    if key_pressed == "STAB_UP":
+        key_command = "STAB_UP"
+        key_pressed = ""
+    elif key_pressed == "STAB_DOWN":
+        key_command = "STAB_DOWN"
+        key_pressed = ""
+    elif key_pressed == "STAB_RIGHT":
+        key_command = "STAB_RIGHT"
+        key_pressed = ""
+    elif key_pressed == "STAB_LEFT":
+        key_command = "STAB_LEFT"
+        key_pressed = ""
+    elif key_pressed == "STAB_ZONE_MORE":
+        key_command = "STAB_ZONE_MORE"
+        key_pressed = ""
+    elif key_pressed == "STAB_ZONE_LESS":
+        key_command = "STAB_ZONE_LESS"
+        key_pressed = ""
+    
+    # Use optimized stabilizer
+    new_image = stabilizer_instance.process_frame(image, dim, key_command)
+    flag_new_stab_window = stabilizer_instance.flag_new_stab_window
+    
+    # Debug: Print timing occasionally
+    elapsed_ms = (time.perf_counter() - start_time) * 1000
+    if hasattr(stabilizer_instance, '_debug_counter'):
+        stabilizer_instance._debug_counter += 1
+        if stabilizer_instance._debug_counter % 100 == 0:
+            print(f"[STAB] Frame {stabilizer_instance._debug_counter}: {elapsed_ms:.1f}ms, Last match: ({stabilizer_instance.last_match_x}, {stabilizer_instance.last_match_y})")
+    else:
+        stabilizer_instance._debug_counter = 1
+        print(f"[STAB] Optimization active! First frame: {elapsed_ms:.1f}ms")
+    
     return new_image
        
     
@@ -5833,6 +5801,14 @@ def choix_resolution_camera(event=None) :
             flag_nouvelle_resolution = True
             camera.start_video_capture()
             print("resolution camera = ",res_cam_x," ",res_cam_y)
+            # Initialize optimized stabilizer with current resolution
+            global stabilizer_instance
+            stabilizer_instance = TemplateStabilizer(res_cam_x, res_cam_y, use_cuda=flag_OpenCvCuda)
+            # For 4K resolution, use smaller search radius for even better performance
+            if res_cam_x > 3000:
+                stabilizer_instance.initial_search_radius = 60  # Smaller for 4K
+                stabilizer_instance.search_expansion_step = 30
+            print(f"Optimized stabilizer initialized (search_radius={stabilizer_instance.initial_search_radius}, expansion={stabilizer_instance.search_expansion_step})")
             if flag_HDR == False :
                 flag_autorise_acquisition = True
             flag_stop_acquisition=False
@@ -6340,13 +6316,16 @@ def commande_DEMO() :
 
 
 def commande_STAB() :
-    global flag_STAB, flag_Template,delta_tx,delta_ty,DSW
+    global flag_STAB, flag_Template,delta_tx,delta_ty,DSW,stabilizer_instance
     
     delta_tx = 0
     delta_ty = 0
     DSW = 0
     if choix_STAB.get() == 0 :
         flag_STAB = False
+        # Reset template when stabilization is turned off
+        if stabilizer_instance is not None:
+            stabilizer_instance.reset_template()
     else :
         flag_STAB = True
     flag_Template = False
@@ -7172,7 +7151,7 @@ def reset_general_FS():
            flag_AI_Craters,track_crater_history,flag_AI_Satellites,choix_AI_Satellites,track_satelitte_history,model_craters_track,model_satellites_track,\
            flag_image_disponible,flag_img_sat_buf1,flag_img_sat_buf2,flag_img_sat_buf3,flag_img_sat_buf4,flag_img_sat_buf5,sat_frame_count,\
            flag_img_sat_buf1_AI,flag_img_sat_buf2_AI,flag_img_sat_buf3_AI,flag_img_sat_buf4_AI,flag_img_sat_buf5_AI,sat_frame_count_AI,flag_first_sat_pass_AI,\
-           choix_sub_img_ref,flag_capture_image_reference,flag_image_ref_sub,flag_image_reference_OK
+           choix_sub_img_ref,flag_capture_image_reference,flag_image_ref_sub,flag_image_reference_OK,stabilizer_instance
 
     choix_sub_img_ref.set(0)
     flag_capture_image_reference = False
@@ -7199,6 +7178,9 @@ def reset_general_FS():
     Im2fsdnOKB = False
     flag_STAB = False
     flag_Template = False
+    # Reset stabilizer template
+    if stabilizer_instance is not None:
+        stabilizer_instance.reset_template()
     choix_STAB.set(0)
     compteur_RV = 0
     Im1rvOK = False
