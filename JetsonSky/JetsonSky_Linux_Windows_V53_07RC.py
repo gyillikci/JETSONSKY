@@ -455,6 +455,12 @@ delta_BX = 0
 delta_BY = 0
 key_pressed = ""
 DSW = 0
+val_STAB_THRES = 20
+last_match_center_x = 0
+last_match_center_y = 0
+stab_method = 0  # 0=Template Matching, 1=Optical Flow, 2=Hybrid
+optical_flow_points = None
+optical_flow_prev_gray = None
 SER_depth = 8
 previous_frame_number = -1
 frame_position = 0
@@ -3601,8 +3607,164 @@ def Image_Quality(image,IQ_Method):
     return Image_Qual
 
 
+def OpticalFlow_tracking(image, dim):
+    """Optical flow-based stabilization using KLT tracker"""
+    global optical_flow_points, optical_flow_prev_gray, delta_tx, delta_ty, flag_new_stab_window, key_pressed, DSW
+    global last_match_center_x, last_match_center_y
+    
+    # Convert to grayscale
+    if dim == 3:
+        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    else:
+        gray = image
+    
+    # Parameters for Shi-Tomasi corner detection
+    feature_params = dict(maxCorners=100, qualityLevel=0.3, minDistance=7, blockSize=7)
+    
+    # Parameters for Lucas-Kanade optical flow
+    lk_params = dict(winSize=(15, 15), maxLevel=2,
+                     criteria=(cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 10, 0.03))
+    
+    # Initialize or reinitialize tracking
+    if optical_flow_prev_gray is None or optical_flow_points is None or len(optical_flow_points) < 10 or flag_new_stab_window:
+        # Define ROI for feature detection (center region)
+        if res_cam_x > 1500:
+            rs = res_cam_y // 2 - res_cam_y // (12 + DSW)
+            re = res_cam_y // 2 + res_cam_y // (12 + DSW)
+            cs = res_cam_x // 2 - res_cam_x // (12 + DSW)
+            ce = res_cam_x // 2 + res_cam_x // (12 + DSW)
+        else:
+            rs = res_cam_y // 2 - res_cam_y // (6 + DSW)
+            re = res_cam_y // 2 + res_cam_y // (6 + DSW)
+            cs = res_cam_x // 2 - res_cam_x // (6 + DSW)
+            ce = res_cam_x // 2 + res_cam_x // (6 + DSW)
+        
+        # Detect good features in ROI
+        roi = gray[rs:re, cs:ce]
+        p0 = cv2.goodFeaturesToTrack(roi, mask=None, **feature_params)
+        
+        if p0 is not None:
+            # Adjust coordinates back to full frame
+            optical_flow_points = p0 + np.array([cs, rs], dtype=np.float32)
+            optical_flow_prev_gray = gray.copy()
+            last_match_center_x = (cs + ce) // 2
+            last_match_center_y = (rs + re) // 2
+            flag_new_stab_window = False
+        
+        return image
+    
+    # Calculate optical flow
+    p1, st, err = cv2.calcOpticalFlowPyrLK(optical_flow_prev_gray, gray, optical_flow_points, None, **lk_params)
+    
+    if p1 is not None and st is not None:
+        # Select good points
+        good_new = p1[st == 1]
+        good_old = optical_flow_points[st == 1]
+        
+        if len(good_new) > 5:  # Need at least 5 points
+            # Calculate median motion
+            motion = good_new - good_old
+            median_dx = np.median(motion[:, 0])
+            median_dy = np.median(motion[:, 1])
+            
+            # Update deltas (accumulate motion)
+            delta_tx -= int(median_dx)
+            delta_ty -= int(median_dy)
+            
+            # Update tracking points and previous frame
+            optical_flow_points = good_new.reshape(-1, 1, 2)
+            optical_flow_prev_gray = gray.copy()
+            
+            # Draw tracking visualization
+            vis_image = image.copy()
+            if dim == 1:
+                vis_image = cv2.cvtColor(vis_image, cv2.COLOR_GRAY2BGR)
+            
+            # Draw tracked points (green circles)
+            for pt in good_new:
+                x, y = pt.ravel()
+                cv2.circle(vis_image, (int(x), int(y)), 3, (0, 255, 0), -1)
+            
+            # Draw motion vectors (blue lines)
+            for i, (new, old) in enumerate(zip(good_new, good_old)):
+                a, b = new.ravel()
+                c, d = old.ravel()
+                cv2.line(vis_image, (int(a), int(b)), (int(c), int(d)), (255, 0, 0), 1)
+            
+            # Display tracking info
+            cv2.putText(vis_image, f"Points: {len(good_new)}", (10, 30),
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+            cv2.putText(vis_image, f"Motion: ({median_dx:.1f}, {median_dy:.1f})", (10, 60),
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+            
+            # Apply stabilization with bounds checking
+            width = int(image.shape[1] * 2)
+            height = int(image.shape[0] * 2)
+            if dim == 3:
+                tmp_image = np.zeros((height, width, 3), np.uint8)
+            else:
+                tmp_image = np.zeros((height, width), np.uint8)
+            
+            # Calculate target position with bounds checking
+            rs = int(res_cam_y / 4 + delta_ty)
+            re = int(rs + res_cam_y)
+            cs = int(res_cam_x / 4 + delta_tx)
+            ce = int(cs + res_cam_x)
+            
+            # Clamp to valid range
+            if rs < 0 or re > height or cs < 0 or ce > width or rs >= re or cs >= ce:
+                # Reset deltas if out of bounds
+                delta_tx = 0
+                delta_ty = 0
+                rs = int(res_cam_y / 4)
+                re = int(rs + res_cam_y)
+                cs = int(res_cam_x / 4)
+                ce = int(cs + res_cam_x)
+            
+            tmp_image[rs:re, cs:ce] = vis_image
+            
+            rs = res_cam_y // 4
+            re = res_cam_y // 4 + res_cam_y
+            cs = res_cam_x // 4
+            ce = res_cam_x // 4 + res_cam_x
+            new_image = tmp_image[rs:re, cs:ce]
+            
+            return new_image
+        else:
+            # Not enough points, reinitialize
+            optical_flow_points = None
+            optical_flow_prev_gray = None
+    else:
+        # Tracking failed, reinitialize
+        optical_flow_points = None
+        optical_flow_prev_gray = None
+    
+    return image
+
+
 def Template_tracking(image,dim) :
-    global flag_STAB,flag_Template,Template,gsrc,gtmpl,gresult,matcher,delta_tx,delta_ty,start_point,end_point,flag_new_stab_window,key_pressed,DSW
+    global flag_STAB,flag_Template,Template,gsrc,gtmpl,gresult,matcher,delta_tx,delta_ty,start_point,end_point,flag_new_stab_window,key_pressed,DSW,val_STAB_THRES,last_match_center_x,last_match_center_y,stab_method
+    
+    # Dispatch to appropriate tracking method
+    if stab_method == 1:  # Optical Flow
+        return OpticalFlow_tracking(image, dim)
+    elif stab_method == 2:  # Hybrid (use both)
+        # Use optical flow for fast tracking, template matching for re-initialization
+        if optical_flow_points is None or len(optical_flow_points) < 10:
+            # Use template matching to initialize
+            stab_method = 0
+            result = Template_tracking_impl(image, dim)
+            stab_method = 2
+            return result
+        else:
+            return OpticalFlow_tracking(image, dim)
+    else:  # Template Matching (default)
+        return Template_tracking_impl(image, dim)
+
+
+def Template_tracking_impl(image, dim):
+    """Original template matching implementation"""
+    global flag_STAB,flag_Template,Template,gsrc,gtmpl,gresult,matcher,delta_tx,delta_ty,start_point,end_point,flag_new_stab_window,key_pressed,DSW,val_STAB_THRES,last_match_center_x,last_match_center_y
 
     old_tx = delta_tx
     old_ty = delta_ty
@@ -3640,31 +3802,31 @@ def Template_tracking(image,dim) :
     
     if flag_Template == False :
         if res_cam_x > 1500 :
-            rs = res_cam_y // 2 - res_cam_y // (8 + DSW) + delta_ty
-            re = res_cam_y // 2 + res_cam_y // (8 + DSW) + delta_ty
-            cs = res_cam_x // 2 - res_cam_x // (8 + DSW) + delta_tx
-            ce = res_cam_x // 2 + res_cam_x // (8 + DSW) + delta_tx
+            rs = res_cam_y // 2 - res_cam_y // (12 + DSW) + delta_ty
+            re = res_cam_y // 2 + res_cam_y // (12 + DSW) + delta_ty
+            cs = res_cam_x // 2 - res_cam_x // (12 + DSW) + delta_tx
+            ce = res_cam_x // 2 + res_cam_x // (12 + DSW) + delta_tx
             if cs < 30 or ce > (res_cam_x - 30) :
                 delta_tx = old_tx
-                cs = res_cam_x // 2 - res_cam_x // (8 + DSW) + delta_tx
-                ce = res_cam_x // 2 + res_cam_x // (8 + DSW) + delta_tx
+                cs = res_cam_x // 2 - res_cam_x // (12 + DSW) + delta_tx
+                ce = res_cam_x // 2 + res_cam_x // (12 + DSW) + delta_tx
             if rs < 30 or re > (res_cam_y - 30) :
                 delta_ty = old_ty
-                rs = res_cam_y // 2 - res_cam_y // (8 + DSW) + delta_ty
-                re = res_cam_y // 2 + res_cam_y // (8 + DSW) + delta_ty
+                rs = res_cam_y // 2 - res_cam_y // (12 + DSW) + delta_ty
+                re = res_cam_y // 2 + res_cam_y // (12 + DSW) + delta_ty
         else :
-            rs = res_cam_y // 2 - res_cam_y // (3 + DSW) + delta_ty
-            re = res_cam_y // 2 + res_cam_y // (3 + DSW) + delta_ty
-            cs = res_cam_x // 2 - res_cam_x // (3 + DSW) + delta_tx
-            ce = res_cam_x // 2 + res_cam_x // (3 + DSW) + delta_tx
+            rs = res_cam_y // 2 - res_cam_y // (6 + DSW) + delta_ty
+            re = res_cam_y // 2 + res_cam_y // (6 + DSW) + delta_ty
+            cs = res_cam_x // 2 - res_cam_x // (6 + DSW) + delta_tx
+            ce = res_cam_x // 2 + res_cam_x // (6 + DSW) + delta_tx
             if cs < 30 or ce > (res_cam_x - 30) :
                 delta_tx = old_tx
-                cs = res_cam_x // 2 - res_cam_x // (3 + DSW) + delta_tx
-                ce = res_cam_x // 2 + res_cam_x // (3 + DSW) + delta_tx
+                cs = res_cam_x // 2 - res_cam_x // (6 + DSW) + delta_tx
+                ce = res_cam_x // 2 + res_cam_x // (6 + DSW) + delta_tx
             if rs < 30 or re > (res_cam_y - 30) :
                 delta_ty = old_ty
-                rs = res_cam_y // 2 - res_cam_y // (3 + DSW) + delta_ty
-                re = res_cam_y // 2 + res_cam_y // (3 + DSW) + delta_ty            
+                rs = res_cam_y // 2 - res_cam_y // (6 + DSW) + delta_ty
+                re = res_cam_y // 2 + re_cam_y // (6 + DSW) + delta_ty            
         start_point = (cs,rs)
         end_point = (ce,re)
         Template = image[rs:re,cs:ce]
@@ -3681,24 +3843,51 @@ def Template_tracking(image,dim) :
         flag_Template = True
         new_image = image
         flag_new_stab_window = True
+        # Initialize last match center at image center
+        last_match_center_x = res_cam_x // 2
+        last_match_center_y = res_cam_y // 2
     else :
         flag_new_stab_window = False
+        
+        # Convert to grayscale if needed
+        if dim == 3 :
+            imageGray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+        else :
+            imageGray = image
+        
+        # Define ROI as red rectangle (1.25x template size, centered on last match center)
+        # This matches the red rectangle visualization
+        padding = max(Template.shape[0], Template.shape[1]) // 8
+        roi_x1 = max(0, last_match_center_x - padding - Template.shape[1] // 2)
+        roi_y1 = max(0, last_match_center_y - padding - Template.shape[0] // 2)
+        roi_x2 = min(imageGray.shape[1], last_match_center_x + padding + Template.shape[1] // 2)
+        roi_y2 = min(imageGray.shape[0], last_match_center_y + padding + Template.shape[0] // 2)
+        
+        # Extract ROI for template matching
+        imageGray_ROI = imageGray[roi_y1:roi_y2, roi_x1:roi_x2]
+        
+        # Perform template matching on ROI
+        # Note: OpenCV CPU is faster than CUDA for small ROIs due to lower overhead
         if flag_OpenCvCuda == False :
-            if dim == 3 :
-                imageGray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-            else :
-                imageGray = image
-            result = cv2.matchTemplate(imageGray, Template,cv2.TM_CCOEFF_NORMED)
+            result = cv2.matchTemplate(imageGray_ROI, Template, cv2.TM_CCOEFF_NORMED)
             (minVal, maxVal, minLoc, maxLoc) = cv2.minMaxLoc(result)
         else :
-            if dim == 3 :
-                imageGray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-            else :
-                imageGray = image
-            gsrc.upload(imageGray)
+            gsrc.upload(imageGray_ROI)
             gresult = matcher.match(gsrc, gtmpl)
             result = gresult.download()
             (minVal, maxVal, minLoc, maxLoc) = cv2.minMaxLoc(result)
+        
+        # Adjust maxLoc coordinates back to full image coordinates
+        maxLoc = (maxLoc[0] + roi_x1, maxLoc[1] + roi_y1)
+        
+        # Check if confidence meets threshold (convert slider 0-100 to 0.0-1.0)
+        confidence_threshold = val_STAB_THRES / 100.0
+        match_confidence = maxVal  # Store for display
+        
+        if maxVal < confidence_threshold :
+            # Confidence too low, return original image without stabilization
+            return image
+        
         if maxVal > 0.2 :
             try :
                 width = int(image.shape[1] * 2)
@@ -3708,6 +3897,40 @@ def Template_tracking(image,dim) :
                 else :
                     tmp_image = np.zeros((height,width),np.uint8)
                 (startX, startY) = maxLoc
+                
+                # Update last match center for next frame's ROI
+                last_match_center_x = startX + Template.shape[1] // 2
+                last_match_center_y = startY + Template.shape[0] // 2
+                
+                # Draw rectangles around matched template location on the original image
+                match_img = image.copy()
+                
+                # Calculate larger rectangle (1.25x the template size, centered on the match)
+                padding = max(Template.shape[0], Template.shape[1]) // 8
+                large_x1 = max(0, startX - padding)
+                large_y1 = max(0, startY - padding)
+                large_x2 = min(image.shape[1], startX + Template.shape[1] + padding)
+                large_y2 = min(image.shape[0], startY + Template.shape[0] + padding)
+                
+                if dim == 3:
+                    # Draw larger red rectangle
+                    cv2.rectangle(match_img, (large_x1, large_y1), (large_x2, large_y2), 
+                                 (0, 0, 255), 2)  # Red rectangle (larger)
+                    # Draw smaller green rectangle (exact match)
+                    cv2.rectangle(match_img, (startX, startY), 
+                                 (startX + Template.shape[1], startY + Template.shape[0]), 
+                                 (0, 255, 0), 2)  # Green rectangle
+                else:
+                    # Convert grayscale to color to draw colored rectangles
+                    match_img = cv2.cvtColor(match_img, cv2.COLOR_GRAY2BGR)
+                    # Draw larger red rectangle
+                    cv2.rectangle(match_img, (large_x1, large_y1), (large_x2, large_y2), 
+                                 (0, 0, 255), 2)  # Red rectangle (larger)
+                    # Draw smaller green rectangle (exact match)
+                    cv2.rectangle(match_img, (startX, startY), 
+                                 (startX + Template.shape[1], startY + Template.shape[0]), 
+                                 (0, 255, 0), 2)  # Green rectangle
+                
                 midX = startX + Template.shape[1]//2
                 midY = startY + Template.shape[0]//2
                 DeltaX = image.shape[1] // 2 + delta_tx - midX
@@ -3716,7 +3939,7 @@ def Template_tracking(image,dim) :
                 re = int(rs + res_cam_y) # Y down
                 cs = int(res_cam_x / 4 + DeltaX) # X left
                 ce = int(cs + res_cam_x) # X right
-                tmp_image[rs:re,cs:ce] = image
+                tmp_image[rs:re,cs:ce] = match_img  # Use image with rectangle
                 rs = res_cam_y // 4  # Y up
                 re = res_cam_y // 4 + res_cam_y # Y down
                 cs = res_cam_x // 4  # X left
@@ -3726,6 +3949,55 @@ def Template_tracking(image,dim) :
                 new_image = image
         else :
             new_image = image
+    
+    # Overlay template in bottom right corner for visualization
+    if flag_Template == True and Template is not None:
+        try:
+            # Get template dimensions
+            if dim == 3:
+                # Template is grayscale, convert to color for overlay
+                template_color = cv2.cvtColor(Template, cv2.COLOR_GRAY2BGR)
+                th, tw = Template.shape
+            else:
+                # Template is grayscale, convert to color for overlay
+                template_color = cv2.cvtColor(Template, cv2.COLOR_GRAY2BGR)
+                th, tw = Template.shape
+            
+            # Calculate position in bottom right (with 10px margin)
+            overlay_y = new_image.shape[0] - th - 10
+            overlay_x = new_image.shape[1] - tw - 10
+            
+            # Ensure we don't go out of bounds
+            if overlay_y > 0 and overlay_x > 0:
+                # Add white border around template for visibility
+                border_size = 2
+                template_with_border = cv2.copyMakeBorder(template_color, border_size, border_size, border_size, border_size, 
+                                                          cv2.BORDER_CONSTANT, value=(255, 255, 255))
+                th_border = template_with_border.shape[0]
+                tw_border = template_with_border.shape[1]
+                overlay_y = new_image.shape[0] - th_border - 10
+                overlay_x = new_image.shape[1] - tw_border - 10
+                
+                # Overlay template on image
+                if dim == 3:
+                    new_image[overlay_y:overlay_y+th_border, overlay_x:overlay_x+tw_border] = template_with_border
+                    # Add confidence text if not first frame
+                    if not flag_new_stab_window and 'match_confidence' in locals():
+                        confidence_text = f"Conf: {match_confidence*100:.1f}%"
+                        cv2.putText(new_image, confidence_text, (overlay_x, overlay_y - 5), 
+                                   cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
+                else:
+                    # Convert grayscale new_image to color for overlay
+                    new_image_color = cv2.cvtColor(new_image, cv2.COLOR_GRAY2BGR)
+                    new_image_color[overlay_y:overlay_y+th_border, overlay_x:overlay_x+tw_border] = template_with_border
+                    # Add confidence text if not first frame
+                    if not flag_new_stab_window and 'match_confidence' in locals():
+                        confidence_text = f"Conf: {match_confidence*100:.1f}%"
+                        cv2.putText(new_image_color, confidence_text, (overlay_x, overlay_y - 5), 
+                                   cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
+                    new_image = cv2.cvtColor(new_image_color, cv2.COLOR_BGR2GRAY)
+        except:
+            pass  # Silently fail if overlay doesn't work
             
     return new_image
        
@@ -7454,6 +7726,28 @@ def choix_val_BFR(event=None) :
     val_BFR = echelle300.get()
 
 
+def choix_val_STAB_THRES(event=None) :
+    global val_STAB_THRES, echelle_STAB_THRES
+    
+    val_STAB_THRES = echelle_STAB_THRES.get()
+
+
+def choix_stab_method(method):
+    global stab_method, flag_Template, optical_flow_points, optical_flow_prev_gray
+    
+    # Reset tracking when changing methods
+    flag_Template = False
+    optical_flow_points = None
+    optical_flow_prev_gray = None
+    
+    if method == "Template":
+        stab_method = 0
+    elif method == "OptFlow":
+        stab_method = 1
+    elif method == "Hybrid":
+        stab_method = 2
+
+
 def choix_position_frame(event=None) :
     global  echelle210,video,flag_new_frame_position,flag_SER_file,video_frame_position
     
@@ -8151,6 +8445,18 @@ CBEPFSB.place(anchor="w",x=1750+delta_s, y=560)
 # Stabilization
 CBSTAB = Checkbutton(cadre,text="STAB", variable=choix_STAB,command=commande_STAB,onvalue = 1, offvalue = 0)
 CBSTAB.place(anchor="w",x=1840+delta_s, y=525)
+echelle_STAB_THRES = Scale (cadre, from_ = 0, to = 100, command= choix_val_STAB_THRES, orient=HORIZONTAL, length = 100, width = 7, resolution = 5, label="Conf%",showvalue=1,tickinterval=50,sliderlength=20)
+echelle_STAB_THRES.set(val_STAB_THRES)
+echelle_STAB_THRES.place(anchor="w", x=1890+delta_s,y=525)
+
+# Stabilization method selector
+label_stab_method = Label(cadre, text="Method:")
+label_stab_method.place(anchor="w", x=1840+delta_s, y=555)
+stab_method_var = StringVar()
+stab_method_var.set("Template")
+stab_method_menu = OptionMenu(cadre, stab_method_var, "Template", "OptFlow", "Hybrid", command=lambda x: choix_stab_method(x))
+stab_method_menu.config(width=8)
+stab_method_menu.place(anchor="w", x=1895+delta_s, y=550)
 
 # Image Quality Estimate
 CBIMQE = Checkbutton(cadre,text="IQE", variable=choix_IMQE,command=commande_IMQE,onvalue = 1, offvalue = 0)

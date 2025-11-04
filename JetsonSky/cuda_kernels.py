@@ -2366,3 +2366,58 @@ void KNN_Mono_C(unsigned char *dest_r, unsigned char *img_r, int imageW, int ima
     }
 }
 ''', 'KNN_Mono_C')
+
+# Template Matching Cross-Correlation Kernel
+cross_correlation_kernel = cp.RawKernel(r'''
+extern "C" __global__
+void cross_correlation(const unsigned char* image, const unsigned char* templ,
+                       float* result, int img_width, int img_height,
+                       int tpl_width, int tpl_height,
+                       int roi_x, int roi_y) {
+    // Each thread computes correlation at one position
+    int x = blockIdx.x * blockDim.x + threadIdx.x;
+    int y = blockIdx.y * blockDim.y + threadIdx.y;
+    
+    int result_width = img_width - tpl_width + 1;
+    int result_height = img_height - tpl_height + 1;
+    
+    if (x >= result_width || y >= result_height) return;
+    
+    // Calculate template mean
+    float tpl_mean = 0.0f;
+    int tpl_pixels = tpl_width * tpl_height;
+    for (int ty = 0; ty < tpl_height; ty++) {
+        for (int tx = 0; tx < tpl_width; tx++) {
+            tpl_mean += templ[ty * tpl_width + tx];
+        }
+    }
+    tpl_mean /= tpl_pixels;
+    
+    // Calculate image patch mean
+    float img_mean = 0.0f;
+    for (int ty = 0; ty < tpl_height; ty++) {
+        for (int tx = 0; tx < tpl_width; tx++) {
+            img_mean += image[(roi_y + y + ty) * img_width + (roi_x + x + tx)];
+        }
+    }
+    img_mean /= tpl_pixels;
+    
+    // Calculate normalized cross-correlation (similar to TM_CCOEFF_NORMED)
+    float numerator = 0.0f;
+    float img_variance = 0.0f;
+    float tpl_variance = 0.0f;
+    
+    for (int ty = 0; ty < tpl_height; ty++) {
+        for (int tx = 0; tx < tpl_width; tx++) {
+            float img_val = image[(roi_y + y + ty) * img_width + (roi_x + x + tx)] - img_mean;
+            float tpl_val = templ[ty * tpl_width + tx] - tpl_mean;
+            numerator += img_val * tpl_val;
+            img_variance += img_val * img_val;
+            tpl_variance += tpl_val * tpl_val;
+        }
+    }
+    
+    float denominator = sqrtf(img_variance * tpl_variance + 1e-5f);
+    result[y * result_width + x] = numerator / denominator;
+}
+''', 'cross_correlation')
