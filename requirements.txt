@@ -1,0 +1,31 @@
+﻿# JetsonSky Requirements File
+# Python 3.12.x recommended (PyTorch compatibility)
+
+# Core Scientific Libraries
+numpy>=1.24.0
+pillow>=10.0.0
+
+# Computer Vision
+opencv-python>=4.8.0
+
+# GPU Computing (CUDA 12.x)
+cupy-cuda12x>=13.0.0
+
+# Deep Learning (PyTorch with CUDA 12.1)
+--index-url https://download.pytorch.org/whl/cu121
+torch>=2.0.0
+torchvision>=0.15.0
+torchaudio>=2.0.0
+
+# Object Detection
+ultralytics>=8.0.0
+
+# Input Handling
+keyboard>=0.13.5; sys_platform == 'win32'
+pynput>=1.7.6; sys_platform == 'linux'
+
+# System Utilities
+psutil>=5.9.0
+
+# Additional dependencies
+matplotlib>=3.7.0
